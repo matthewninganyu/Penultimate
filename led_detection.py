@@ -2,18 +2,23 @@ from __future__ import annotations
 
 import argparse
 import math
-from dataclasses import dataclass
 
 import cv2
 import numpy as np
 
+from config import (
+    DEFAULT_LOWER_LED,
+    DEFAULT_MIN_AREA,
+    DEFAULT_UPPER_LED,
+    MORPH_CLOSE_ITERATIONS,
+    MORPH_KERNEL_SIZE,
+    MORPH_OPEN_ITERATIONS,
+)
+from models import LedCandidate
 
-MORPH_KERNEL_SIZE = (5, 5)
-MORPH_OPEN_ITERATIONS = 1
-MORPH_CLOSE_ITERATIONS = 2
 
-DEFAULT_HSV_LOWER = np.array([10, 150, 220], dtype=np.uint8)
-DEFAULT_HSV_UPPER = np.array([40, 255, 255], dtype=np.uint8)
+DEFAULT_HSV_LOWER = DEFAULT_LOWER_LED
+DEFAULT_HSV_UPPER = DEFAULT_UPPER_LED
 
 SELECTED_RADIUS = 24
 CENTROID_RADIUS = 4
@@ -27,13 +32,29 @@ WHITE = (255, 255, 255)
 SELECTION_STRATEGIES = ("rightmost", "leftmost", "largest")
 
 
-@dataclass(frozen=True)
-class LedCandidate:
-    x: int
-    y: int
-    area: float
-    circularity: float
-    contour: np.ndarray
+class LedDetector:
+    def __init__(
+        self,
+        lower_hsv: np.ndarray | None = None,
+        upper_hsv: np.ndarray | None = None,
+        min_area: float = DEFAULT_MIN_AREA,
+    ) -> None:
+        self.lower_hsv = DEFAULT_LOWER_LED.copy() if lower_hsv is None else lower_hsv
+        self.upper_hsv = DEFAULT_UPPER_LED.copy() if upper_hsv is None else upper_hsv
+        self.min_area = min_area
+        self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, MORPH_KERNEL_SIZE)
+
+    def detect(self, bgr_frame: np.ndarray) -> tuple[list[LedCandidate], np.ndarray]:
+        mask = create_led_mask(bgr_frame, self.kernel, self.lower_hsv, self.upper_hsv)
+        return candidates_from_mask_and_frame(bgr_frame, mask, self.min_area), mask
+
+
+def parse_hsv_triplet(h: int, s: int, v: int) -> np.ndarray:
+    if not 0 <= h <= 179:
+        raise ValueError("HSV hue must be 0..179.")
+    if not 0 <= s <= 255 or not 0 <= v <= 255:
+        raise ValueError("HSV saturation/value must be 0..255.")
+    return np.array([h, s, v], dtype=np.uint8)
 
 
 def parse_hsv_threshold(value: str, argument_name: str) -> np.ndarray:
@@ -49,15 +70,10 @@ def parse_hsv_threshold(value: str, argument_name: str) -> np.ndarray:
             f"{argument_name} must contain exactly three values: H,S,V."
         )
 
-    hue, saturation, value_channel = parts
-    if not 0 <= hue <= 179:
-        raise argparse.ArgumentTypeError(f"{argument_name} hue must be 0..179.")
-    if not 0 <= saturation <= 255 or not 0 <= value_channel <= 255:
-        raise argparse.ArgumentTypeError(
-            f"{argument_name} saturation/value must be 0..255."
-        )
-
-    return np.array(parts, dtype=np.uint8)
+    try:
+        return parse_hsv_triplet(parts[0], parts[1], parts[2])
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"{argument_name} {error}") from error
 
 
 def calculate_circularity(contour: np.ndarray, area: float) -> float:
@@ -89,55 +105,102 @@ def create_led_mask(
     )
 
 
-def find_led_candidates(mask: np.ndarray, min_area: float) -> list[LedCandidate]:
+def candidates_from_mask_and_frame(
+    bgr_frame: np.ndarray,
+    mask: np.ndarray,
+    min_area: float,
+) -> list[LedCandidate]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    gray = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2GRAY)
     candidates: list[LedCandidate] = []
 
     for contour in contours:
-        area = float(cv2.contourArea(contour))
-        if area < min_area:
-            continue
+        candidate = candidate_from_contour(contour, gray, mask, min_area)
+        if candidate is not None:
+            candidates.append(candidate)
 
-        moments = cv2.moments(contour)
-        if moments["m00"] == 0:
-            continue
+    return sorted(candidates, key=lambda candidate: candidate.peak_brightness, reverse=True)
 
-        x = int(round(moments["m10"] / moments["m00"]))
-        y = int(round(moments["m01"] / moments["m00"]))
-        candidates.append(
-            LedCandidate(
-                x=x,
-                y=y,
-                area=area,
-                circularity=calculate_circularity(contour, area),
-                contour=contour,
-            )
-        )
+
+def find_led_candidates(mask: np.ndarray, min_area: float) -> list[LedCandidate]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    synthetic_brightness = np.where(mask > 0, 255, 0).astype(np.uint8)
+    candidates: list[LedCandidate] = []
+
+    for contour in contours:
+        candidate = candidate_from_contour(contour, synthetic_brightness, mask, min_area)
+        if candidate is not None:
+            candidates.append(candidate)
 
     return candidates
+
+
+def candidate_from_contour(
+    contour: np.ndarray,
+    brightness_image: np.ndarray,
+    mask: np.ndarray,
+    min_area: float,
+) -> LedCandidate | None:
+    area = float(cv2.contourArea(contour))
+    if area < min_area:
+        return None
+
+    moments = cv2.moments(contour)
+    if moments["m00"] == 0:
+        return None
+
+    contour_x = float(moments["m10"] / moments["m00"])
+    contour_y = float(moments["m01"] / moments["m00"])
+    _, _, width, height = cv2.boundingRect(contour)
+    (_, _), radius = cv2.minEnclosingCircle(contour)
+
+    roi_mask = np.zeros(mask.shape, dtype=np.uint8)
+    cv2.drawContours(roi_mask, [contour], -1, 255, thickness=-1)
+    pixel_values = brightness_image[roi_mask > 0].astype(np.float64)
+    ys, xs = np.nonzero(roi_mask)
+    if pixel_values.size == 0:
+        return None
+
+    weight_sum = float(pixel_values.sum())
+    if weight_sum > 0:
+        weighted_x = float((xs * pixel_values).sum() / weight_sum)
+        weighted_y = float((ys * pixel_values).sum() / weight_sum)
+    else:
+        weighted_x = contour_x
+        weighted_y = contour_y
+
+    peak_index = int(np.argmax(pixel_values))
+    return LedCandidate(
+        x=weighted_x,
+        y=weighted_y,
+        contour_x=contour_x,
+        contour_y=contour_y,
+        peak_x=float(xs[peak_index]),
+        peak_y=float(ys[peak_index]),
+        area=area,
+        radius=float(radius),
+        width=float(width),
+        height=float(height),
+        circularity=calculate_circularity(contour, area),
+        mean_brightness=float(pixel_values.mean()),
+        peak_brightness=float(pixel_values.max()),
+        contour=contour,
+    )
 
 
 def select_physical_led(
     candidates: list[LedCandidate],
     strategy: str,
 ) -> LedCandidate | None:
-    """Select the likely physical LED using a camera-specific heuristic.
-
-    In the current dual-camera layout, one camera should use the rightmost
-    candidate and the other should use the leftmost candidate. The opposite
-    blob is treated as screen glare until calibrated stereo geometry replaces
-    this orientation rule.
-    """
+    """Temporary camera-specific fallback heuristic for preview-only scripts."""
     if not candidates:
         return None
-
     if strategy == "rightmost":
-        return max(candidates, key=lambda c: c.x)
+        return max(candidates, key=lambda candidate: candidate.x)
     if strategy == "leftmost":
-        return min(candidates, key=lambda c: c.x)
+        return min(candidates, key=lambda candidate: candidate.x)
     if strategy == "largest":
-        return max(candidates, key=lambda c: c.area)
-
+        return max(candidates, key=lambda candidate: candidate.area)
     raise ValueError(f"Unsupported LED selection strategy: {strategy}")
 
 
@@ -185,17 +248,17 @@ def annotate_frame(
         return annotated
 
     for candidate in candidates:
-        center = (candidate.x, candidate.y)
+        center = (int(round(candidate.x)), int(round(candidate.y)))
         cv2.drawContours(annotated, [candidate.contour], -1, YELLOW, 2)
         cv2.circle(annotated, center, CENTROID_RADIUS, YELLOW, -1)
 
     if selected is not None:
-        selected_center = (selected.x, selected.y)
+        selected_center = (int(round(selected.x)), int(round(selected.y)))
         cv2.circle(annotated, selected_center, SELECTED_RADIUS, GREEN, 3)
         cv2.putText(
             annotated,
             "SELECTED LED",
-            (selected.x + 12, selected.y - 18),
+            (selected_center[0] + 12, selected_center[1] - 18),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             GREEN,
@@ -204,8 +267,8 @@ def annotate_frame(
         )
         cv2.putText(
             annotated,
-            f"x={selected.x} y={selected.y}",
-            (selected.x + 12, selected.y + 10),
+            f"x={selected.x:.1f} y={selected.y:.1f}",
+            (selected_center[0] + 12, selected_center[1] + 10),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
             GREEN,
@@ -225,7 +288,6 @@ def coordinate_changed(
         return previous is not None
     if previous is None:
         return True
-
     return (
         abs(current.x - previous.x) >= min_delta
         or abs(current.y - previous.y) >= min_delta
@@ -235,4 +297,4 @@ def coordinate_changed(
 def format_candidate(candidate: LedCandidate | None) -> str:
     if candidate is None:
         return "none"
-    return f"x={candidate.x}, y={candidate.y}"
+    return f"x={candidate.x:.1f}, y={candidate.y:.1f}"
