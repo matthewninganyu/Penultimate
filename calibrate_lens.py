@@ -28,8 +28,8 @@ DEFAULT_MIN_SAMPLES = 15
 # Sub-pixel refinement stop criteria
 SUBPIX_CRITERIA = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 
-WINDOW_CAPTURE = "Lens Calibration — Capture"
-WINDOW_PREVIEW = "Lens Calibration — Undistortion Preview"
+WINDOW_CAPTURE = "Lens Calibration - Capture"
+WINDOW_PREVIEW = "Lens Calibration - Undistortion Preview"
 
 WHITE = (255, 255, 255)
 GREEN = (0, 255, 0)
@@ -72,14 +72,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_BOARD_COLS,
         metavar="N",
-        help="Inner corner count along the horizontal axis (squares − 1).",
+        help="Inner corner count along the horizontal axis (squares - 1).",
     )
     parser.add_argument(
         "--board-rows",
         type=int,
         default=DEFAULT_BOARD_ROWS,
         metavar="N",
-        help="Inner corner count along the vertical axis (squares − 1).",
+        help="Inner corner count along the vertical axis (squares - 1).",
     )
     parser.add_argument(
         "--square-size",
@@ -210,7 +210,7 @@ def report_and_save(
     elif rms < 1.0:
         quality = "good"
     else:
-        quality = "poor — recapture with more varied board poses"
+        quality = "poor - recapture with more varied board poses"
     print(f"\nCalibration complete ({sample_count} frames).")
     print(f"  RMS reprojection error : {rms:.4f} px  [{quality}]")
     print(f"  Image size             : {image_size[0]}x{image_size[1]}")
@@ -243,7 +243,7 @@ def calibrate_from_images(args: argparse.Namespace) -> int:
     objp = make_object_points(args.board_cols, args.board_rows, args.square_size)
 
     image_paths = collect_image_paths(args.images)
-    print(f"Found {len(image_paths)} image(s) — processing…\n")
+    print(f"Found {len(image_paths)} image(s) - processing...\n")
 
     object_points: list[np.ndarray] = []
     image_points: list[np.ndarray] = []
@@ -293,7 +293,7 @@ def calibrate_from_images(args: argparse.Namespace) -> int:
         )
         return 1
 
-    print(f"\nRunning calibration on {accepted} frame(s)…")
+    print(f"\nRunning calibration on {accepted} frame(s)...")
     assert image_size is not None
     rms, camera_matrix, dist_coeffs = run_calibration(
         object_points, image_points, image_size
@@ -320,7 +320,7 @@ def _draw_hud(
 
     cv2.putText(
         out,
-        f"Lens Calibration — Camera {camera_index}  {w}x{h}",
+        f"Lens Calibration - Camera {camera_index}  {w}x{h}",
         (10, 30),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.75,
@@ -332,7 +332,7 @@ def _draw_hud(
     ready = accepted >= min_samples
     count_color = GREEN if ready else YELLOW
     count_label = (
-        f"Captures: {accepted}/{min_samples}  READY — press C to calibrate"
+        f"Captures: {accepted}/{min_samples}  READY - press C to calibrate"
         if ready
         else f"Captures: {accepted}/{min_samples}"
     )
@@ -341,10 +341,10 @@ def _draw_hud(
     )
 
     if board_detected:
-        board_label = f"Board detected ({board_size[0]}x{board_size[1]}) — SPACE to capture"
+        board_label = f"Board detected ({board_size[0]}x{board_size[1]}) - SPACE to capture"
         board_color = GREEN
     else:
-        board_label = "Searching for checkerboard…"
+        board_label = "Searching for checkerboard..."
         board_color = RED
     cv2.putText(
         out, board_label, (10, 94), cv2.FONT_HERSHEY_SIMPLEX, 0.65, board_color, 2, cv2.LINE_AA
@@ -471,7 +471,7 @@ def calibrate_from_camera(args: argparse.Namespace) -> int:
 
             if key == ord(" "):
                 if corners is None:
-                    print("No board visible — adjust position and try again.")
+                    print("No board visible - adjust position and try again.")
                 else:
                     capture_count += 1
                     object_points.append(objp)
@@ -488,7 +488,7 @@ def calibrate_from_camera(args: argparse.Namespace) -> int:
 
             if key in (ord("c"), ord("C")) and len(object_points) >= args.min_samples:
                 cv2.destroyWindow(WINDOW_CAPTURE)
-                print(f"\nRunning calibration on {len(object_points)} frames…")
+                print(f"\nRunning calibration on {len(object_points)} frames...")
                 assert image_size is not None
                 rms, camera_matrix, dist_coeffs = run_calibration(
                     object_points, image_points, image_size
