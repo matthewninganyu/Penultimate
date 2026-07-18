@@ -7,6 +7,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from led_detection import (
+    MORPH_CLOSE_ITERATIONS,
+    MORPH_KERNEL_SIZE,
+    MORPH_OPEN_ITERATIONS,
+    calculate_circularity,
+)
+
 
 OUTPUT_DIR = Path("output")
 MASK_OUTPUT_NAME = "led_mask.png"
@@ -14,10 +21,6 @@ DETECTION_OUTPUT_NAME = "led_detection.png"
 
 HSV_LOWER_YELLOW_ORANGE = np.array([5, 200, 235], dtype=np.uint8)
 HSV_UPPER_YELLOW_ORANGE = np.array([35, 255, 255], dtype=np.uint8)
-
-MORPH_KERNEL_SIZE = (5, 5)
-MORPH_OPEN_ITERATIONS = 1
-MORPH_CLOSE_ITERATIONS = 2
 
 MIN_CONTOUR_AREA = 100.0
 STRONG_CANDIDATE_MIN_AREA = 1_000.0
@@ -97,13 +100,6 @@ def create_led_mask(image_bgr: np.ndarray) -> np.ndarray:
     )
 
 
-def contour_circularity(contour: np.ndarray, area: float) -> float:
-    perimeter = cv2.arcLength(contour, True)
-    if perimeter == 0:
-        return 0.0
-    return float((4.0 * np.pi * area) / (perimeter * perimeter))
-
-
 def find_led_candidates(mask: np.ndarray) -> list[LedCandidate]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     candidates: list[LedCandidate] = []
@@ -127,7 +123,7 @@ def find_led_candidates(mask: np.ndarray) -> list[LedCandidate]:
                 centroid_x=centroid_x,
                 centroid_y=centroid_y,
                 area=area,
-                circularity=contour_circularity(contour, area),
+                circularity=calculate_circularity(contour, area),
                 bounding_box=bounding_box,
                 contour=contour,
             )

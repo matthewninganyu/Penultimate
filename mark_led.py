@@ -8,6 +8,7 @@ import cv2
 import numpy as np
 
 from detect_led import MASK_OUTPUT_NAME, create_led_mask
+from led_detection import calculate_circularity
 
 
 OUTPUT_DIR = Path("output")
@@ -143,18 +144,11 @@ def select_physical_led(candidates: list[LedCandidate]) -> LedCandidate | None:
     ranked_candidates = sorted(
         candidates,
         key=lambda candidate: (candidate.area / max_area)
-        * candidate_circularity(candidate),
+        * calculate_circularity(candidate.contour, candidate.area),
         reverse=True,
     )
     strongest_candidates = ranked_candidates[:2]
     return max(strongest_candidates, key=lambda candidate: candidate.x)
-
-
-def candidate_circularity(candidate: LedCandidate) -> float:
-    perimeter = cv2.arcLength(candidate.contour, True)
-    if perimeter == 0:
-        return 0.0
-    return float((4.0 * np.pi * candidate.area) / (perimeter * perimeter))
 
 
 def annotate_candidates(
