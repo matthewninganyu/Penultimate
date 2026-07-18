@@ -26,6 +26,7 @@ DEFAULT_PRINT_INTERVAL_SECONDS = 1.0
 
 CAMERA_FORMAT = "RGB888"
 SELECTION_STRATEGIES = ("rightmost", "leftmost", "largest")
+COLOR_ORDERS = ("rgb", "bgr")
 
 LOWER_LED = np.array([10, 150, 220], dtype=np.uint8)
 UPPER_LED = np.array([40, 255, 255], dtype=np.uint8)
@@ -75,6 +76,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
     parser.add_argument("--min-area", type=float, default=DEFAULT_MIN_AREA)
     parser.add_argument(
+        "--color-order",
+        choices=COLOR_ORDERS,
+        default="rgb",
+        help=(
+            "Channel order returned by Picamera2 capture_array. Use 'bgr' if "
+            "the main preview shows blue skin or swapped red/blue colors."
+        ),
+    )
+    parser.add_argument(
+        "--hsv-lower",
+        default="10,150,220",
+        help="Lower HSV LED threshold as H,S,V.",
+    )
+    parser.add_argument(
+        "--hsv-upper",
+        default="40,255,255",
+        help="Upper HSV LED threshold as H,S,V.",
+    )
+    parser.add_argument(
         "--left-strategy",
         choices=SELECTION_STRATEGIES,
         default=DEFAULT_LEFT_STRATEGY,
@@ -105,7 +125,33 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.camera_left is None:
         args.camera_left = args.camera
+    args.hsv_lower = parse_hsv_threshold(args.hsv_lower, "--hsv-lower")
+    args.hsv_upper = parse_hsv_threshold(args.hsv_upper, "--hsv-upper")
     return args
+
+
+def parse_hsv_threshold(value: str, argument_name: str) -> np.ndarray:
+    try:
+        parts = [int(part.strip()) for part in value.split(",")]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            f"{argument_name} must contain three integers like 10,150,220."
+        ) from error
+
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError(
+            f"{argument_name} must contain exactly three values: H,S,V."
+        )
+
+    hue, saturation, value_channel = parts
+    if not 0 <= hue <= 179:
+        raise argparse.ArgumentTypeError(f"{argument_name} hue must be 0..179.")
+    if not 0 <= saturation <= 255 or not 0 <= value_channel <= 255:
+        raise argparse.ArgumentTypeError(
+            f"{argument_name} saturation/value must be 0..255."
+        )
+
+    return np.array(parts, dtype=np.uint8)
 
 
 def ensure_picamera2_available() -> None:
@@ -148,7 +194,11 @@ def configure_camera(camera_index: int, width: int, height: int) -> Any:
     return camera
 
 
-def capture_bgr_frame(camera: Any, camera_label: str) -> np.ndarray:
+def capture_bgr_frame(
+    camera: Any,
+    camera_label: str,
+    color_order: str,
+) -> np.ndarray:
     try:
         frame = camera.capture_array()
     except Exception as error:
@@ -162,9 +212,16 @@ def capture_bgr_frame(camera: Any, camera_label: str) -> np.ndarray:
             f"{camera_label} returned an unsupported frame shape: {frame.shape}"
         )
 
-    # Picamera2 is configured for RGB888, while the existing OpenCV detection
-    # and annotation pipeline expects BGR channel order.
-    return cv2.cvtColor(frame[:, :, :3], cv2.COLOR_RGB2BGR)
+    frame = frame[:, :, :3]
+    if color_order == "rgb":
+        # Picamera2 is configured for RGB888, while the existing OpenCV
+        # detection and annotation pipeline expects BGR channel order.
+        return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    if color_order == "bgr":
+        # Some camera/libcamera combinations can already produce BGR-like
+        # arrays. Use this when the preview has swapped red/blue colors.
+        return frame
+    raise ValueError(f"Unsupported color order: {color_order}")
 
 
 def ensure_frame_size(frame: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -173,9 +230,14 @@ def ensure_frame_size(frame: np.ndarray, width: int, height: int) -> np.ndarray:
     return cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
 
 
-def create_led_mask(frame: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+def create_led_mask(
+    frame: np.ndarray,
+    kernel: np.ndarray,
+    hsv_lower: np.ndarray,
+    hsv_upper: np.ndarray,
+) -> np.ndarray:
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, LOWER_LED, UPPER_LED)
+    mask = cv2.inRange(hsv, hsv_lower, hsv_upper)
     opened = cv2.morphologyEx(
         mask,
         cv2.MORPH_OPEN,
@@ -402,7 +464,8 @@ def run_detection(args: argparse.Namespace) -> None:
         f"resolution={args.width}x{args.height}, format={CAMERA_FORMAT}, "
         f"min_area={args.min_area}, left_strategy={args.left_strategy}, "
         f"right_strategy={args.right_strategy}, show_mask={args.show_mask}, "
-        f"headless={args.headless}"
+        f"headless={args.headless}, color_order={args.color_order}, "
+        f"hsv_lower={args.hsv_lower.tolist()}, hsv_upper={args.hsv_upper.tolist()}"
     )
 
     try:
@@ -420,8 +483,16 @@ def run_detection(args: argparse.Namespace) -> None:
 
         while True:
             try:
-                frame_left = capture_bgr_frame(camera_left, "Camera 0")
-                frame_right = capture_bgr_frame(camera_right, "Camera 1")
+                frame_left = capture_bgr_frame(
+                    camera_left,
+                    "Camera 0",
+                    args.color_order,
+                )
+                frame_right = capture_bgr_frame(
+                    camera_right,
+                    "Camera 1",
+                    args.color_order,
+                )
             except RuntimeError as error:
                 print(f"Capture warning: {error}")
                 time.sleep(0.05)
@@ -442,8 +513,18 @@ def run_detection(args: argparse.Namespace) -> None:
                 )
                 frame_right = ensure_frame_size(frame_right, args.width, args.height)
 
-            mask_left = create_led_mask(frame_left, kernel)
-            mask_right = create_led_mask(frame_right, kernel)
+            mask_left = create_led_mask(
+                frame_left,
+                kernel,
+                args.hsv_lower,
+                args.hsv_upper,
+            )
+            mask_right = create_led_mask(
+                frame_right,
+                kernel,
+                args.hsv_lower,
+                args.hsv_upper,
+            )
             candidates_left = find_led_candidates(mask_left, args.min_area)
             candidates_right = find_led_candidates(mask_right, args.min_area)
             selected_left = select_physical_led(candidates_left, args.left_strategy)
