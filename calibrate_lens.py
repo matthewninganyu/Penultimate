@@ -163,8 +163,11 @@ def find_checkerboard_corners(
         | cv2.CALIB_CB_NORMALIZE_IMAGE
         | cv2.CALIB_CB_FAST_CHECK
     )
-    found, corners = cv2.findChessboardCorners(gray, board_size, None, flags)
-    if not found:
+    try:
+        found, corners = cv2.findChessboardCorners(gray, board_size, None, flags)
+    except Exception:
+        return None
+    if not found or corners is None or corners.size == 0:
         return None
     return cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), SUBPIX_CRITERIA)
 
@@ -469,18 +472,19 @@ def calibrate_from_camera(args: argparse.Namespace) -> int:
             if key == ord(" "):
                 if corners is None:
                     print("No board visible — adjust position and try again.")
-                    continue
-                capture_count += 1
-                object_points.append(objp)
-                image_points.append(corners)
-                print(
-                    f"  Captured {capture_count} "
-                    f"({len(object_points)}/{args.min_samples} minimum)"
-                )
-                if args.save_frames:
-                    cv2.imwrite(
-                        str(args.save_frames / f"frame_{capture_count:03d}.png"), frame
+                else:
+                    capture_count += 1
+                    object_points.append(objp)
+                    image_points.append(corners)
+                    print(
+                        f"  Captured {capture_count} "
+                        f"({len(object_points)}/{args.min_samples} minimum)"
                     )
+                    if args.save_frames:
+                        cv2.imwrite(
+                            str(args.save_frames / f"frame_{capture_count:03d}.png"),
+                            frame,
+                        )
 
             if key in (ord("c"), ord("C")) and len(object_points) >= args.min_samples:
                 cv2.destroyWindow(WINDOW_CAPTURE)
