@@ -141,6 +141,7 @@ def parse_args() -> argparse.Namespace:
 # Core calibration helpers
 # ---------------------------------------------------------------------------
 
+
 def make_object_points(
     board_cols: int,
     board_rows: int,
@@ -222,6 +223,7 @@ def report_and_save(
 # ---------------------------------------------------------------------------
 # --images path: calibrate from a directory or glob of saved frames
 # ---------------------------------------------------------------------------
+
 
 def collect_image_paths(images_arg: str) -> list[Path]:
     target = Path(images_arg)
@@ -307,6 +309,7 @@ def calibrate_from_images(args: argparse.Namespace) -> int:
 # Live capture path
 # ---------------------------------------------------------------------------
 
+
 def _draw_hud(
     frame: np.ndarray,
     camera_index: int,
@@ -337,17 +340,33 @@ def _draw_hud(
         else f"Captures: {accepted}/{min_samples}"
     )
     cv2.putText(
-        out, count_label, (10, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.65, count_color, 2, cv2.LINE_AA
+        out,
+        count_label,
+        (10, 62),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        count_color,
+        2,
+        cv2.LINE_AA,
     )
 
     if board_detected:
-        board_label = f"Board detected ({board_size[0]}x{board_size[1]}) - SPACE to capture"
+        board_label = (
+            f"Board detected ({board_size[0]}x{board_size[1]}) - SPACE to capture"
+        )
         board_color = GREEN
     else:
         board_label = "Searching for checkerboard..."
         board_color = RED
     cv2.putText(
-        out, board_label, (10, 94), cv2.FONT_HERSHEY_SIMPLEX, 0.65, board_color, 2, cv2.LINE_AA
+        out,
+        board_label,
+        (10, 94),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        board_color,
+        2,
+        cv2.LINE_AA,
     )
 
     cv2.putText(
@@ -386,7 +405,9 @@ def _undistortion_preview(
             print(f"Preview capture error: {e}")
             break
         frame = ensure_frame_size(frame, w, h)
-        undistorted = cv2.undistort(frame, camera_matrix, dist_coeffs, None, new_cam_matrix)
+        undistorted = cv2.undistort(
+            frame, camera_matrix, dist_coeffs, None, new_cam_matrix
+        )
 
         # Crop to valid ROI then scale back to original size so the side-by-side
         # panels stay the same pixel dimensions.
@@ -395,8 +416,26 @@ def _undistortion_preview(
         else:
             cropped = undistorted
 
-        cv2.putText(frame, "Original", (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, RED, 2, cv2.LINE_AA)
-        cv2.putText(cropped, "Undistorted", (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.9, GREEN, 2, cv2.LINE_AA)
+        cv2.putText(
+            frame,
+            "Original",
+            (10, 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            RED,
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            cropped,
+            "Undistorted",
+            (10, 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            GREEN,
+            2,
+            cv2.LINE_AA,
+        )
         cv2.imshow(WINDOW_PREVIEW, np.hstack((frame, cropped)))
 
         key = cv2.waitKey(1) & 0xFF
@@ -537,6 +576,7 @@ def calibrate_from_camera(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     args = parse_args()

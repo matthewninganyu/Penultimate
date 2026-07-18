@@ -33,6 +33,12 @@ from led_detection import (
     select_physical_led,
 )
 
+import socket
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+mac_ip = "192.168.2.2"
+port = 5005
+
 
 DEFAULT_CAMERA_LEFT = 0
 DEFAULT_CAMERA_RIGHT = 1
@@ -45,6 +51,9 @@ DEFAULT_PRINT_INTERVAL_SECONDS = 1.0
 
 FRAME_WINDOW_NAME = "Dual Camera LED Tracking"
 MASK_WINDOW_NAME = "Dual Camera LED Masks"
+
+lCorners = []
+rCorners = []
 
 
 def parse_args() -> argparse.Namespace:
@@ -295,6 +304,15 @@ def run_detection(args: argparse.Namespace) -> None:
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q") or key == ord("Q"):
                 break
+
+            if key == ord("c") and selected_left and selected_right:
+                lCorners.append((selected_left.x, selected_left.y))
+                rCorners.append((selected_right.x, selected_right.y))
+
+        x, y = (0, 0)  # your logic here
+        msg = f"{x},{y};1".encode()
+        sock.sendto(msg, (mac_ip, port))
+
     finally:
         safe_camera_call(camera_left, "stop", "camera 0")
         safe_camera_call(camera_right, "stop", "camera 1")
