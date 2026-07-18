@@ -1,765 +1,387 @@
 from __future__ import annotations
 
 import argparse
-import math
+import logging
 import time
-from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
 
 import cv2
 import numpy as np
 
-try:
-    from picamera2 import Picamera2
-except ImportError:  # pragma: no cover - exercised on non-Raspberry Pi systems.
-    Picamera2 = None  # type: ignore[assignment]
+from camera_manager import DualCameraManager, OfflineFrameSource
+from config import (
+    DEFAULT_CAMERA_0,
+    DEFAULT_CAMERA_1,
+    DEFAULT_HEIGHT,
+    DEFAULT_MAX_FRAME_SKEW_MS,
+    DEFAULT_MAX_JUMP_MM,
+    DEFAULT_MAX_REPROJECTION_ERROR,
+    DEFAULT_MIN_AREA,
+    DEFAULT_SCREEN_CALIBRATION,
+    DEFAULT_SCREEN_MARGIN_MM,
+    DEFAULT_SMOOTHING_ALPHA,
+    DEFAULT_TRACKING_CONFIDENCE_THRESHOLD,
+    DEFAULT_WIDTH,
+)
+from contact_detection import ContactDetector
+from led_detection import LedDetector, parse_hsv_triplet
+from models import CameraFrame, ContactEvidence, LedCandidate, PenState, ScreenCalibration, ScreenPosition, StereoMatch
+from network_sender import UdpPenSender
+from screen_mapping import load_screen_calibration, point_to_screen_position, validate_runtime_resolution
+from stereo_matching import choose_best_stereo_match
+from tracking_filter import ExponentialPenFilter
 
 
-DEFAULT_CAMERA_LEFT = 0
-DEFAULT_CAMERA_RIGHT = 1
-DEFAULT_WIDTH = 640
-DEFAULT_HEIGHT = 480
-DEFAULT_MIN_AREA = 30.0
-DEFAULT_LEFT_STRATEGY = "rightmost"
-DEFAULT_RIGHT_STRATEGY = "leftmost"
-DEFAULT_PRINT_INTERVAL_SECONDS = 1.0
-
-CAMERA_FORMAT = "RGB888"
-SELECTION_STRATEGIES = ("rightmost", "leftmost", "largest")
-COLOR_ORDERS = ("rgb", "bgr")
-FOV_MODES = ("full", "current")
-
-LOWER_LED = np.array([10, 150, 220], dtype=np.uint8)
-UPPER_LED = np.array([40, 255, 255], dtype=np.uint8)
-
-MORPH_KERNEL_SIZE = (5, 5)
-MORPH_OPEN_ITERATIONS = 1
-MORPH_CLOSE_ITERATIONS = 2
-
-SELECTED_RADIUS = 24
-CENTROID_RADIUS = 4
-COORDINATE_PRINT_DELTA_PIXELS = 8
-
-FRAME_WINDOW_NAME = "Dual Camera LED Tracking"
-MASK_WINDOW_NAME = "Dual Camera LED Masks"
-
-YELLOW = (0, 255, 255)
-GREEN = (0, 255, 0)
-RED = (0, 0, 255)
-WHITE = (255, 255, 255)
-
-
-@dataclass(frozen=True)
-class LedCandidate:
-    x: int
-    y: int
-    area: float
-    circularity: float
-    contour: np.ndarray
+LOGGER = logging.getLogger(__name__)
+FRAME_WINDOW_NAME = "Penultimate Tracking"
+MASK_WINDOW_NAME = "Penultimate LED Masks"
+SNAPSHOT_DIR = Path("output")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Realtime dual Raspberry Pi CSI camera LED detector."
-    )
-    parser.add_argument(
-        "--camera",
-        type=int,
-        default=DEFAULT_CAMERA_LEFT,
-        help=(
-            "Backward-compatible alias for --camera-left. "
-            "Ignored when --camera-left is supplied."
-        ),
-    )
-    parser.add_argument("--camera-left", type=int, default=None)
-    parser.add_argument("--camera-right", type=int, default=DEFAULT_CAMERA_RIGHT)
+    parser = argparse.ArgumentParser(description="Penultimate calibrated dual-camera pen tracker.")
+    parser.add_argument("--camera-0", type=int, default=DEFAULT_CAMERA_0)
+    parser.add_argument("--camera-1", type=int, default=DEFAULT_CAMERA_1)
+    parser.add_argument("--camera-left", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--camera-right", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
-    parser.add_argument(
-        "--fov-mode",
-        choices=FOV_MODES,
-        default="full",
-        help=(
-            "Use 'full' to request the widest available sensor crop and "
-            "downscale it to the preview size, or 'current' to keep "
-            "Picamera2's automatic mode choice."
-        ),
-    )
+    parser.add_argument("--fov-mode", choices=("full", "current"), default="full")
+    parser.add_argument("--color-order", choices=("rgb", "bgr"), default="rgb")
     parser.add_argument("--min-area", type=float, default=DEFAULT_MIN_AREA)
-    parser.add_argument(
-        "--color-order",
-        choices=COLOR_ORDERS,
-        default="rgb",
-        help=(
-            "Channel order returned by Picamera2 capture_array. Use 'bgr' if "
-            "the main preview shows blue skin or swapped red/blue colors."
-        ),
-    )
-    parser.add_argument(
-        "--hsv-lower",
-        default="10,150,220",
-        help="Lower HSV LED threshold as H,S,V.",
-    )
-    parser.add_argument(
-        "--hsv-upper",
-        default="40,255,255",
-        help="Upper HSV LED threshold as H,S,V.",
-    )
-    parser.add_argument(
-        "--left-strategy",
-        choices=SELECTION_STRATEGIES,
-        default=DEFAULT_LEFT_STRATEGY,
-        help=(
-            "Candidate selection strategy for camera 0 / left preview. "
-            "Defaults to rightmost for the current dual-camera glare layout."
-        ),
-    )
-    parser.add_argument(
-        "--right-strategy",
-        choices=SELECTION_STRATEGIES,
-        default=DEFAULT_RIGHT_STRATEGY,
-        help=(
-            "Candidate selection strategy for camera 1 / right preview. "
-            "Defaults to leftmost for the current dual-camera glare layout."
-        ),
-    )
-    parser.add_argument(
-        "--show-mask",
-        action="store_true",
-        help="Show both binary LED masks in a second OpenCV window.",
-    )
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run detection without opening OpenCV display windows.",
-    )
-    parser.add_argument(
-        "--print-interval",
-        type=float,
-        default=DEFAULT_PRINT_INTERVAL_SECONDS,
-        help="Maximum seconds between headless coordinate updates.",
-    )
+    parser.add_argument("--lower-h", type=int, default=10)
+    parser.add_argument("--lower-s", type=int, default=150)
+    parser.add_argument("--lower-v", type=int, default=220)
+    parser.add_argument("--upper-h", type=int, default=40)
+    parser.add_argument("--upper-s", type=int, default=255)
+    parser.add_argument("--upper-v", type=int, default=255)
+    parser.add_argument("--screen-calibration", type=Path, default=DEFAULT_SCREEN_CALIBRATION)
+    parser.add_argument("--show-mask", action="store_true")
+    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--send-udp", action="store_true")
+    parser.add_argument("--laptop-ip", default="127.0.0.1")
+    parser.add_argument("--laptop-port", type=int, default=5005)
+    parser.add_argument("--tracking-confidence-threshold", type=float, default=DEFAULT_TRACKING_CONFIDENCE_THRESHOLD)
+    parser.add_argument("--max-reprojection-error", type=float, default=DEFAULT_MAX_REPROJECTION_ERROR)
+    parser.add_argument("--max-frame-skew-ms", type=float, default=DEFAULT_MAX_FRAME_SKEW_MS)
+    parser.add_argument("--smoothing-alpha", type=float, default=DEFAULT_SMOOTHING_ALPHA)
+    parser.add_argument("--max-jump-mm", type=float, default=DEFAULT_MAX_JUMP_MM)
+    parser.add_argument("--screen-margin-mm", type=float, default=DEFAULT_SCREEN_MARGIN_MM)
+    parser.add_argument("--preview-only", action="store_true", help="Run LED candidate preview without calibration.")
+    parser.add_argument("--offline-left", type=Path, default=None)
+    parser.add_argument("--offline-right", type=Path, default=None)
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
-    if args.camera_left is None:
-        args.camera_left = args.camera
-    args.hsv_lower = parse_hsv_threshold(args.hsv_lower, "--hsv-lower")
-    args.hsv_upper = parse_hsv_threshold(args.hsv_upper, "--hsv-upper")
+    if args.camera_left is not None:
+        args.camera_0 = args.camera_left
+    if args.camera_right is not None:
+        args.camera_1 = args.camera_right
+    if (args.offline_left is None) != (args.offline_right is None):
+        parser.error("--offline-left and --offline-right must be supplied together.")
     return args
 
 
-def parse_hsv_threshold(value: str, argument_name: str) -> np.ndarray:
-    try:
-        parts = [int(part.strip()) for part in value.split(",")]
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(
-            f"{argument_name} must contain three integers like 10,150,220."
-        ) from error
-
-    if len(parts) != 3:
-        raise argparse.ArgumentTypeError(
-            f"{argument_name} must contain exactly three values: H,S,V."
-        )
-
-    hue, saturation, value_channel = parts
-    if not 0 <= hue <= 179:
-        raise argparse.ArgumentTypeError(f"{argument_name} hue must be 0..179.")
-    if not 0 <= saturation <= 255 or not 0 <= value_channel <= 255:
-        raise argparse.ArgumentTypeError(
-            f"{argument_name} saturation/value must be 0..255."
-        )
-
-    return np.array(parts, dtype=np.uint8)
+def make_invalid_state(sequence: int, frame_skew_ms: float | None) -> PenState:
+    return PenState(
+        sequence=sequence,
+        timestamp=time.time(),
+        valid=False,
+        normalized_x=None,
+        normalized_y=None,
+        pixel_x=None,
+        pixel_y=None,
+        x_mm=None,
+        y_mm=None,
+        distance_mm=None,
+        touching=False,
+        contact_confidence=0.0,
+        tracking_confidence=0.0,
+        frame_skew_ms=frame_skew_ms,
+    )
 
 
-def ensure_picamera2_available() -> None:
-    if Picamera2 is None:
-        raise RuntimeError(
-            "Picamera2 is not installed. On Raspberry Pi OS, run: "
-            "sudo apt install -y python3-picamera2 python3-opencv python3-venv"
-        )
+def make_valid_state(
+    sequence: int,
+    position: ScreenPosition,
+    contact: ContactEvidence,
+    tracking_confidence: float,
+    frame_skew_ms: float,
+) -> PenState:
+    return PenState(
+        sequence=sequence,
+        timestamp=time.time(),
+        valid=True,
+        normalized_x=position.normalized_x,
+        normalized_y=position.normalized_y,
+        pixel_x=position.pixel_x,
+        pixel_y=position.pixel_y,
+        x_mm=position.x_mm,
+        y_mm=position.y_mm,
+        distance_mm=position.distance_mm,
+        touching=contact.touching,
+        contact_confidence=contact.confidence,
+        tracking_confidence=tracking_confidence,
+        frame_skew_ms=frame_skew_ms,
+    )
 
 
-def print_available_cameras() -> list[dict[str, Any]]:
-    ensure_picamera2_available()
-    camera_info = Picamera2.global_camera_info()
-    print("Available Picamera2 cameras:")
-    if not camera_info:
-        print("  none")
-    for index, info in enumerate(camera_info):
-        print(f"  [{index}] {info}")
-    return camera_info
-
-
-def crop_limits_to_tuple(crop_limits: Any) -> tuple[int, int, int, int] | None:
-    if crop_limits is None:
+def load_runtime_calibration(args: argparse.Namespace) -> ScreenCalibration | None:
+    if args.preview_only:
         return None
-
-    if all(hasattr(crop_limits, attr) for attr in ("x", "y", "width", "height")):
-        return (
-            int(crop_limits.x),
-            int(crop_limits.y),
-            int(crop_limits.width),
-            int(crop_limits.height),
-        )
-
-    try:
-        x_offset, y_offset, width, height = crop_limits
-    except (TypeError, ValueError):
-        return None
-
-    return (int(x_offset), int(y_offset), int(width), int(height))
+    calibration = load_screen_calibration(args.screen_calibration)
+    validate_runtime_resolution(calibration, args.width, args.height)
+    return calibration
 
 
-def crop_area(crop_limits: tuple[int, int, int, int]) -> int:
-    return crop_limits[2] * crop_limits[3]
+def create_frame_source(args: argparse.Namespace) -> DualCameraManager | OfflineFrameSource:
+    if args.offline_left is not None and args.offline_right is not None:
+        return OfflineFrameSource(str(args.offline_left), str(args.offline_right))
+    return DualCameraManager(
+        args.camera_0,
+        args.camera_1,
+        args.width,
+        args.height,
+        fov_mode=args.fov_mode,
+        color_order=args.color_order,
+    )
 
 
-def find_largest_fov_sensor_mode(
-    camera: Any,
-) -> tuple[int, dict[str, Any], tuple[int, int, int, int]] | None:
-    sensor_modes = getattr(camera, "sensor_modes", None)
-    if not sensor_modes:
-        return None
-
-    largest_mode: tuple[int, dict[str, Any], tuple[int, int, int, int]] | None = None
-    for mode_index, sensor_mode in enumerate(sensor_modes):
-        crop_limits = crop_limits_to_tuple(sensor_mode.get("crop_limits"))
-        if crop_limits is None:
-            continue
-        if largest_mode is None or crop_area(crop_limits) > crop_area(largest_mode[2]):
-            largest_mode = (mode_index, sensor_mode, crop_limits)
-
-    return largest_mode
-
-
-def format_sensor_mode(sensor_mode: dict[str, Any]) -> str:
-    details = []
-    for key in ("size", "format", "bit_depth", "fps", "crop_limits"):
-        if key in sensor_mode:
-            details.append(f"{key}={sensor_mode[key]}")
-    return ", ".join(details) if details else str(sensor_mode)
-
-
-def configure_camera(
-    camera_index: int,
-    width: int,
-    height: int,
-    fov_mode: str,
-) -> tuple[Any, tuple[int, int, int, int] | None]:
-    ensure_picamera2_available()
-
-    try:
-        camera = Picamera2(camera_index)
-    except Exception as error:
-        raise RuntimeError(f"Camera {camera_index} cannot be opened: {error}") from error
-
-    full_fov_crop = None
-    selected_mode = None
-    if fov_mode == "full":
-        selected_mode = find_largest_fov_sensor_mode(camera)
-        if selected_mode is None:
-            print(
-                f"Camera {camera_index}: no sensor mode with crop_limits was found; "
-                "falling back to Picamera2's automatic mode choice."
-            )
-        else:
-            mode_index, sensor_mode, full_fov_crop = selected_mode
-            print(
-                f"Camera {camera_index}: selected full-FOV sensor mode "
-                f"[{mode_index}] ({format_sensor_mode(sensor_mode)}), "
-                f"requested preview={width}x{height}."
-            )
-
-    main = {"size": (width, height), "format": CAMERA_FORMAT}
-    if selected_mode is not None:
-        try:
-            video_config = camera.create_video_configuration(
-                main=main,
-                raw=selected_mode[1],
-            )
-            camera.configure(video_config)
-        except Exception as selected_error:
-            print(
-                f"Camera {camera_index}: could not configure the selected "
-                f"full-FOV raw sensor mode ({selected_error}); using "
-                "Picamera2's automatic mode choice."
-            )
-            full_fov_crop = None
-            try:
-                video_config = camera.create_video_configuration(main=main)
-                camera.configure(video_config)
-            except Exception as fallback_error:
-                raise RuntimeError(
-                    f"Camera {camera_index} cannot be configured: {fallback_error}"
-                ) from fallback_error
-    else:
-        try:
-            video_config = camera.create_video_configuration(main=main)
-            camera.configure(video_config)
-        except Exception as error:
-            raise RuntimeError(
-                f"Camera {camera_index} cannot be configured: {error}"
-            ) from error
-
-    return camera, full_fov_crop
-
-
-def set_full_fov_crop(
-    camera: Any,
-    camera_index: int,
-    full_fov_crop: tuple[int, int, int, int] | None,
-) -> None:
-    if full_fov_crop is None:
-        return
-
-    try:
-        camera.set_controls({"ScalerCrop": full_fov_crop})
-    except Exception as error:
-        print(
-            f"Warning: Camera {camera_index} could not set full-FOV "
-            f"ScalerCrop={full_fov_crop}: {error}"
-        )
-        return
-
-    active_crop = None
-    try:
-        metadata = camera.capture_metadata()
-        active_crop = metadata.get("ScalerCrop")
-    except Exception as error:
-        print(
-            f"Warning: Camera {camera_index} could not read active ScalerCrop: {error}"
-        )
-
-    if active_crop is None:
-        print(f"Camera {camera_index}: requested ScalerCrop={full_fov_crop}.")
-    else:
-        print(
-            f"Camera {camera_index}: requested ScalerCrop={full_fov_crop}, "
-            f"active ScalerCrop={active_crop}."
-        )
-
-
-def capture_bgr_frame(
-    camera: Any,
+def annotate_camera(
+    frame: np.ndarray,
     camera_label: str,
-    color_order: str,
-) -> np.ndarray:
-    try:
-        frame = camera.capture_array()
-    except Exception as error:
-        raise RuntimeError(f"{camera_label} failed while capturing: {error}") from error
-
-    if frame is None:
-        raise RuntimeError(f"{camera_label} returned an empty frame.")
-
-    if frame.ndim != 3 or frame.shape[2] < 3:
-        raise RuntimeError(
-            f"{camera_label} returned an unsupported frame shape: {frame.shape}"
-        )
-
-    frame = frame[:, :, :3]
-    if color_order == "rgb":
-        # Picamera2 is configured for RGB888, while the existing OpenCV
-        # detection and annotation pipeline expects BGR channel order.
-        return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    if color_order == "bgr":
-        # Some camera/libcamera combinations can already produce BGR-like
-        # arrays. Use this when the preview has swapped red/blue colors.
-        return frame
-    raise ValueError(f"Unsupported color order: {color_order}")
-
-
-def ensure_frame_size(frame: np.ndarray, width: int, height: int) -> np.ndarray:
-    if frame.shape[1] == width and frame.shape[0] == height:
-        return frame
-    return cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
-
-
-def create_led_mask(
-    frame: np.ndarray,
-    kernel: np.ndarray,
-    hsv_lower: np.ndarray,
-    hsv_upper: np.ndarray,
-) -> np.ndarray:
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, hsv_lower, hsv_upper)
-    opened = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_OPEN,
-        kernel,
-        iterations=MORPH_OPEN_ITERATIONS,
-    )
-    return cv2.morphologyEx(
-        opened,
-        cv2.MORPH_CLOSE,
-        kernel,
-        iterations=MORPH_CLOSE_ITERATIONS,
-    )
-
-
-def calculate_circularity(contour: np.ndarray, area: float) -> float:
-    perimeter = cv2.arcLength(contour, True)
-    if perimeter == 0:
-        return 0.0
-    return float((4.0 * math.pi * area) / (perimeter * perimeter))
-
-
-def find_led_candidates(mask: np.ndarray, min_area: float) -> list[LedCandidate]:
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidates: list[LedCandidate] = []
-
-    for contour in contours:
-        area = float(cv2.contourArea(contour))
-        if area < min_area:
-            continue
-
-        moments = cv2.moments(contour)
-        if moments["m00"] == 0:
-            continue
-
-        x = int(round(moments["m10"] / moments["m00"]))
-        y = int(round(moments["m01"] / moments["m00"]))
-        candidates.append(
-            LedCandidate(
-                x=x,
-                y=y,
-                area=area,
-                circularity=calculate_circularity(contour, area),
-                contour=contour,
-            )
-        )
-
-    return candidates
-
-
-def select_physical_led(
-    candidates: list[LedCandidate],
-    strategy: str,
-) -> LedCandidate | None:
-    """Select the likely physical LED using a camera-specific heuristic.
-
-    In the current dual-camera layout, one camera should use the rightmost
-    candidate and the other should use the leftmost candidate. The opposite
-    blob is treated as screen glare until calibrated stereo geometry replaces
-    this orientation rule.
-    """
-    if not candidates:
-        return None
-
-    if strategy == "rightmost":
-        return max(candidates, key=lambda candidate: candidate.x)
-    if strategy == "leftmost":
-        return min(candidates, key=lambda candidate: candidate.x)
-    if strategy == "largest":
-        return max(candidates, key=lambda candidate: candidate.area)
-
-    raise ValueError(f"Unsupported LED selection strategy: {strategy}")
-
-
-def annotate_frame(
-    frame: np.ndarray,
     candidates: list[LedCandidate],
     selected: LedCandidate | None,
-    camera_label: str,
-    fps: float,
+    reflection: LedCandidate | None,
+    detailed: bool,
 ) -> np.ndarray:
-    annotated = frame.copy()
-
-    cv2.putText(
-        annotated,
-        camera_label,
-        (12, 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        WHITE,
-        2,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        annotated,
-        f"FPS: {fps:.1f}",
-        (12, 58),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        WHITE,
-        2,
-        cv2.LINE_AA,
-    )
-
-    if not candidates:
-        cv2.putText(
-            annotated,
-            "NO LED DETECTED",
-            (12, 92),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.75,
-            RED,
-            2,
-            cv2.LINE_AA,
-        )
-        return annotated
-
+    out = frame.copy()
+    cv2.putText(out, camera_label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
     for candidate in candidates:
-        center = (candidate.x, candidate.y)
-        cv2.drawContours(annotated, [candidate.contour], -1, YELLOW, 2)
-        cv2.circle(annotated, center, CENTROID_RADIUS, YELLOW, -1)
-
+        center = (int(round(candidate.x)), int(round(candidate.y)))
+        cv2.drawContours(out, [candidate.contour], -1, (0, 255, 255), 1)
+        cv2.circle(out, center, 4, (0, 255, 255), -1)
+        if detailed:
+            cv2.putText(
+                out,
+                f"a={candidate.area:.0f} b={candidate.peak_brightness:.0f}",
+                (center[0] + 6, center[1] - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+    if reflection is not None:
+        center = (int(round(reflection.x)), int(round(reflection.y)))
+        cv2.circle(out, center, 14, (255, 0, 255), 2)
+        cv2.putText(out, "REFLECTION", (center[0] + 8, center[1] + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
     if selected is not None:
-        selected_center = (selected.x, selected.y)
-        cv2.circle(annotated, selected_center, SELECTED_RADIUS, GREEN, 3)
-        cv2.putText(
-            annotated,
-            "SELECTED LED",
-            (selected.x + 12, selected.y - 18),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            GREEN,
-            2,
-            cv2.LINE_AA,
+        center = (int(round(selected.x)), int(round(selected.y)))
+        cv2.circle(out, center, 22, (0, 255, 0), 2)
+        cv2.putText(out, f"LED x={selected.x:.1f} y={selected.y:.1f}", (center[0] + 10, center[1] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    return out
+
+
+def draw_system_overlay(
+    combined: np.ndarray,
+    state: PenState,
+    fps: float,
+    processing_ms: dict[str, float],
+    match: StereoMatch | None,
+) -> np.ndarray:
+    lines = [
+        f"FPS {fps:.1f} skew={state.frame_skew_ms if state.frame_skew_ms is not None else -1:.1f}ms",
+        f"valid={state.valid} track={state.tracking_confidence:.2f} contact={state.contact_confidence:.2f} {'TOUCH' if state.touching else 'HOVER'}",
+    ]
+    if state.valid:
+        lines.extend(
+            [
+                f"mm=({state.x_mm:.1f}, {state.y_mm:.1f}, {state.distance_mm:.1f})",
+                f"norm=({state.normalized_x:.3f}, {state.normalized_y:.3f}) px=({state.pixel_x}, {state.pixel_y})",
+            ]
         )
-        cv2.putText(
-            annotated,
-            f"x={selected.x} y={selected.y}",
-            (selected.x + 12, selected.y + 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            GREEN,
-            2,
-            cv2.LINE_AA,
-        )
-
-    return annotated
-
-
-def coordinate_changed(
-    previous: LedCandidate | None,
-    current: LedCandidate | None,
-    min_delta: int,
-) -> bool:
-    if current is None:
-        return previous is not None
-    if previous is None:
-        return True
-
-    return (
-        abs(current.x - previous.x) >= min_delta
-        or abs(current.y - previous.y) >= min_delta
+    if match is not None:
+        lines.append(f"reproj={match.reprojection_error:.2f}px geom={match.geometry_score:.2f}")
+    lines.append(
+        " ".join(f"{key}={value:.1f}ms" for key, value in processing_ms.items())
     )
+    for index, line in enumerate(lines):
+        cv2.putText(combined, line, (12, 32 + index * 26), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
+    return combined
 
 
-def should_print_coordinates(
-    previous_left: LedCandidate | None,
-    previous_right: LedCandidate | None,
-    current_left: LedCandidate | None,
-    current_right: LedCandidate | None,
-    last_print_time: float,
-    print_interval: float,
-) -> bool:
-    if coordinate_changed(
-        previous_left,
-        current_left,
-        COORDINATE_PRINT_DELTA_PIXELS,
-    ):
-        return True
-    if coordinate_changed(
-        previous_right,
-        current_right,
-        COORDINATE_PRINT_DELTA_PIXELS,
-    ):
-        return True
-    return time.perf_counter() - last_print_time >= print_interval
+def save_snapshot(frame0: np.ndarray, frame1: np.ndarray, mask0: np.ndarray, mask1: np.ndarray, sequence: int) -> None:
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(SNAPSHOT_DIR / f"snapshot_{sequence:06d}_camera_0.png"), frame0)
+    cv2.imwrite(str(SNAPSHOT_DIR / f"snapshot_{sequence:06d}_camera_1.png"), frame1)
+    cv2.imwrite(str(SNAPSHOT_DIR / f"snapshot_{sequence:06d}_mask_0.png"), mask0)
+    cv2.imwrite(str(SNAPSHOT_DIR / f"snapshot_{sequence:06d}_mask_1.png"), mask1)
 
 
-def format_candidate(candidate: LedCandidate | None) -> str:
-    if candidate is None:
-        return "none"
-    return f"x={candidate.x}, y={candidate.y}"
+def process_pair(
+    sequence: int,
+    frame0: CameraFrame,
+    frame1: CameraFrame,
+    frame_skew_ms: float,
+    detector: LedDetector,
+    calibration: ScreenCalibration | None,
+    contact_detector: ContactDetector,
+    tracking_filter: ExponentialPenFilter,
+    args: argparse.Namespace,
+) -> tuple[PenState, list[LedCandidate], list[LedCandidate], np.ndarray, np.ndarray, StereoMatch | None, dict[str, float]]:
+    timings: dict[str, float] = {}
+    start = time.perf_counter()
+    det_start = time.perf_counter()
+    candidates0, mask0 = detector.detect(frame0.frame)
+    candidates1, mask1 = detector.detect(frame1.frame)
+    timings["detect"] = (time.perf_counter() - det_start) * 1000.0
+
+    if calibration is None:
+        state = make_invalid_state(sequence, frame_skew_ms)
+        timings["total"] = (time.perf_counter() - start) * 1000.0
+        return state, candidates0, candidates1, mask0, mask1, None, timings
+
+    if frame_skew_ms > args.max_frame_skew_ms:
+        state = make_invalid_state(sequence, frame_skew_ms)
+        timings["total"] = (time.perf_counter() - start) * 1000.0
+        return state, candidates0, candidates1, mask0, mask1, None, timings
+
+    match_start = time.perf_counter()
+    previous_point = tracking_filter.point
+    match = choose_best_stereo_match(
+        candidates0,
+        candidates1,
+        calibration,
+        previous_point=previous_point,
+        max_reprojection_error=args.max_reprojection_error,
+        screen_margin_mm=args.screen_margin_mm,
+        max_jump_mm=args.max_jump_mm,
+    )
+    timings["match"] = (time.perf_counter() - match_start) * 1000.0
+
+    if match is None or match.reprojection_error > args.max_reprojection_error:
+        tracking_filter.update(None)
+        state = make_invalid_state(sequence, frame_skew_ms)
+        timings["total"] = (time.perf_counter() - start) * 1000.0
+        return state, candidates0, candidates1, mask0, mask1, match, timings
+
+    filter_start = time.perf_counter()
+    smoothed, filter_confidence = tracking_filter.update(match.point_3d)
+    timings["filter"] = (time.perf_counter() - filter_start) * 1000.0
+    if smoothed is None:
+        state = make_invalid_state(sequence, frame_skew_ms)
+        timings["total"] = (time.perf_counter() - start) * 1000.0
+        return state, candidates0, candidates1, mask0, mask1, match, timings
+
+    position = point_to_screen_position(smoothed, calibration, args.screen_margin_mm)
+    if position is None:
+        state = make_invalid_state(sequence, frame_skew_ms)
+        timings["total"] = (time.perf_counter() - start) * 1000.0
+        return state, candidates0, candidates1, mask0, mask1, match, timings
+
+    contact_start = time.perf_counter()
+    contact = contact_detector.estimate(candidates0, candidates1, match)
+    timings["contact"] = (time.perf_counter() - contact_start) * 1000.0
+    tracking_confidence = min(match.confidence, filter_confidence)
+    if tracking_confidence < args.tracking_confidence_threshold:
+        state = make_invalid_state(sequence, frame_skew_ms)
+    else:
+        state = make_valid_state(sequence, position, contact, tracking_confidence, frame_skew_ms)
+
+    timings["total"] = (time.perf_counter() - start) * 1000.0
+    return state, candidates0, candidates1, mask0, mask1, match, timings
 
 
-def safe_camera_call(camera: Any | None, method_name: str, label: str) -> None:
-    if camera is None:
-        return
-    try:
-        getattr(camera, method_name)()
-    except Exception as error:
-        print(f"Warning: failed to {method_name} {label}: {error}")
-
-
-def run_detection(args: argparse.Namespace) -> None:
-    camera_info = print_available_cameras()
-    if len(camera_info) < 2:
-        raise RuntimeError(
-            f"Fewer than two cameras detected: found {len(camera_info)}."
-        )
-    if args.camera_left == args.camera_right:
-        raise RuntimeError("Camera indexes must be different for dual-camera preview.")
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, MORPH_KERNEL_SIZE)
-    camera_left = None
-    camera_right = None
-    last_time = time.perf_counter()
-    last_print_time = 0.0
+def run(args: argparse.Namespace) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+    lower = parse_hsv_triplet(args.lower_h, args.lower_s, args.lower_v)
+    upper = parse_hsv_triplet(args.upper_h, args.upper_s, args.upper_v)
+    detector = LedDetector(lower, upper, args.min_area)
+    calibration = load_runtime_calibration(args)
+    source = create_frame_source(args)
+    contact_detector = ContactDetector()
+    tracking_filter = ExponentialPenFilter(args.smoothing_alpha, args.max_jump_mm)
+    sender = UdpPenSender(args.laptop_ip, args.laptop_port) if args.send_udp else None
+    detailed = bool(args.debug)
+    sequence = 0
     fps = 0.0
-    last_printed_left: LedCandidate | None = None
-    last_printed_right: LedCandidate | None = None
-
-    print(
-        "Starting dual realtime LED detector: "
-        f"camera_left={args.camera_left}, camera_right={args.camera_right}, "
-        f"resolution={args.width}x{args.height}, format={CAMERA_FORMAT}, "
-        f"fov_mode={args.fov_mode}, "
-        f"min_area={args.min_area}, left_strategy={args.left_strategy}, "
-        f"right_strategy={args.right_strategy}, show_mask={args.show_mask}, "
-        f"headless={args.headless}, color_order={args.color_order}, "
-        f"hsv_lower={args.hsv_lower.tolist()}, hsv_upper={args.hsv_upper.tolist()}"
-    )
+    last_frame_time = time.perf_counter()
 
     try:
-        camera_left, full_fov_crop_left = configure_camera(
-            args.camera_left,
-            args.width,
-            args.height,
-            args.fov_mode,
-        )
-        camera_right, full_fov_crop_right = configure_camera(
-            args.camera_right,
-            args.width,
-            args.height,
-            args.fov_mode,
-        )
-
-        camera_left.start()
-        camera_right.start()
-        set_full_fov_crop(camera_left, args.camera_left, full_fov_crop_left)
-        set_full_fov_crop(camera_right, args.camera_right, full_fov_crop_right)
-        time.sleep(1.0)
-        print(
-            "Cameras started. Sequential capture is used for this preview, "
-            "so the two frames are not yet hardware synchronized."
-        )
-        print("Press Q to quit the preview, or Ctrl+C to stop.")
-
+        if isinstance(source, DualCameraManager):
+            source.start()
+        LOGGER.info("Penultimate runtime started. Press Q to quit, S snapshot, D details, C recalibration reminder.")
         while True:
-            try:
-                frame_left = capture_bgr_frame(
-                    camera_left,
-                    "Camera 0",
-                    args.color_order,
-                )
-                frame_right = capture_bgr_frame(
-                    camera_right,
-                    "Camera 1",
-                    args.color_order,
-                )
-            except RuntimeError as error:
-                print(f"Capture warning: {error}")
-                time.sleep(0.05)
-                continue
-
-            if frame_left.shape[:2] != (args.height, args.width):
-                print(
-                    "Camera 0 returned a frame with a different size; "
-                    f"resizing from {frame_left.shape[1]}x{frame_left.shape[0]} "
-                    f"to {args.width}x{args.height}."
-                )
-                frame_left = ensure_frame_size(frame_left, args.width, args.height)
-            if frame_right.shape[:2] != (args.height, args.width):
-                print(
-                    "Camera 1 returned a frame with a different size; "
-                    f"resizing from {frame_right.shape[1]}x{frame_right.shape[0]} "
-                    f"to {args.width}x{args.height}."
-                )
-                frame_right = ensure_frame_size(frame_right, args.width, args.height)
-
-            mask_left = create_led_mask(
-                frame_left,
-                kernel,
-                args.hsv_lower,
-                args.hsv_upper,
+            capture_start = time.perf_counter()
+            frame0, frame1, skew_ms = source.capture_pair()
+            capture_ms = (time.perf_counter() - capture_start) * 1000.0
+            state, candidates0, candidates1, mask0, mask1, match, timings = process_pair(
+                sequence,
+                frame0,
+                frame1,
+                skew_ms,
+                detector,
+                calibration,
+                contact_detector,
+                tracking_filter,
+                args,
             )
-            mask_right = create_led_mask(
-                frame_right,
-                kernel,
-                args.hsv_lower,
-                args.hsv_upper,
-            )
-            candidates_left = find_led_candidates(mask_left, args.min_area)
-            candidates_right = find_led_candidates(mask_right, args.min_area)
-            selected_left = select_physical_led(candidates_left, args.left_strategy)
-            selected_right = select_physical_led(candidates_right, args.right_strategy)
+            timings = {"capture": capture_ms, **timings}
+            if sender is not None:
+                sender.send(state)
+            if args.debug or sequence % 15 == 0:
+                LOGGER.info("%s", state.to_packet())
 
             now = time.perf_counter()
-            elapsed = now - last_time
-            last_time = now
+            elapsed = now - last_frame_time
+            last_frame_time = now
             if elapsed > 0:
                 instant_fps = 1.0 / elapsed
-                fps = instant_fps if fps == 0 else (0.9 * fps) + (0.1 * instant_fps)
+                fps = instant_fps if fps == 0.0 else 0.9 * fps + 0.1 * instant_fps
 
-            if should_print_coordinates(
-                last_printed_left,
-                last_printed_right,
-                selected_left,
-                selected_right,
-                last_print_time,
-                args.print_interval,
-            ):
-                print(
-                    f"Camera 0: {format_candidate(selected_left)} | "
-                    f"Camera 1: {format_candidate(selected_right)}"
-                )
-                last_print_time = now
-                last_printed_left = selected_left
-                last_printed_right = selected_right
+            if not args.headless:
+                selected0 = match.camera_0_candidate if match else None
+                selected1 = match.camera_1_candidate if match else None
+                reflection0 = match.reflection_candidate_0 if match else None
+                reflection1 = match.reflection_candidate_1 if match else None
+                annotated0 = annotate_camera(frame0.frame, "CAMERA 0", candidates0, selected0, reflection0, detailed)
+                annotated1 = annotate_camera(frame1.frame, "CAMERA 1", candidates1, selected1, reflection1, detailed)
+                combined = np.hstack((annotated0, annotated1))
+                cv2.imshow(FRAME_WINDOW_NAME, draw_system_overlay(combined, state, fps, timings, match))
+                if args.show_mask:
+                    cv2.imshow(MASK_WINDOW_NAME, np.hstack((mask0, mask1)))
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), ord("Q")):
+                    break
+                if key in (ord("d"), ord("D")):
+                    detailed = not detailed
+                if key in (ord("s"), ord("S")):
+                    save_snapshot(frame0.frame, frame1.frame, mask0, mask1, sequence)
+                    LOGGER.info("Saved snapshot %s", sequence)
+                if key in (ord("c"), ord("C")):
+                    LOGGER.info("Run calibrate_screen.py after moving either camera.")
 
-            if args.headless:
-                continue
-
-            annotated_left = annotate_frame(
-                frame_left,
-                candidates_left,
-                selected_left,
-                "CAMERA 0",
-                fps,
-            )
-            annotated_right = annotate_frame(
-                frame_right,
-                candidates_right,
-                selected_right,
-                "CAMERA 1",
-                fps,
-            )
-            combined_frame = np.hstack((annotated_left, annotated_right))
-            cv2.imshow(FRAME_WINDOW_NAME, combined_frame)
-
-            if args.show_mask:
-                combined_mask = np.hstack(
-                    (
-                        ensure_frame_size(mask_left, args.width, args.height),
-                        ensure_frame_size(mask_right, args.width, args.height),
-                    )
-                )
-                cv2.imshow(MASK_WINDOW_NAME, combined_mask)
-
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("q") or key == ord("Q"):
+            sequence += 1
+            if args.offline_left is not None:
                 break
+    except KeyboardInterrupt:
+        LOGGER.info("Interrupted by Ctrl+C.")
     finally:
-        safe_camera_call(camera_left, "stop", "camera 0")
-        safe_camera_call(camera_right, "stop", "camera 1")
-        safe_camera_call(camera_left, "close", "camera 0")
-        safe_camera_call(camera_right, "close", "camera 1")
+        source.close()
+        if sender is not None:
+            sender.close()
         cv2.destroyAllWindows()
-        print("Dual realtime LED detector shut down cleanly.")
+        LOGGER.info("Penultimate runtime shut down cleanly.")
 
 
 def main() -> None:
-    args = parse_args()
     try:
-        run_detection(args)
-    except KeyboardInterrupt:
-        print("Interrupted by Ctrl+C.")
+        run(parse_args())
     except Exception as error:
-        print(f"Error: {error}")
+        LOGGER.error("%s", error)
         raise SystemExit(1) from error
 
 
