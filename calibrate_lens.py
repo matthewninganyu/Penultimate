@@ -416,6 +416,11 @@ def calibrate_from_camera(args: argparse.Namespace) -> int:
 
     if args.save_frames:
         args.save_frames.mkdir(parents=True, exist_ok=True)
+        existing = sorted(args.save_frames.glob("frame_*.png"))
+        if existing:
+            last = int(existing[-1].stem.split("_")[1])
+            capture_count = last
+            print(f"Resuming from {last} existing frame(s) in {args.save_frames}.")
 
     print(
         f"Camera {args.camera}  {args.width}x{args.height}\n"
