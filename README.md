@@ -85,25 +85,32 @@ Verify the camera:
 rpicam-hello
 ```
 
-Run the realtime detector:
+Run the dual-camera realtime detector:
 
 ```bash
-python realtime_led.py --show-mask
+python realtime.py --show-mask
 ```
 
 Useful options:
 
 ```bash
-python realtime_led.py --width 640 --height 480 --camera 0
-python realtime_led.py --min-area 30
-python realtime_led.py --headless
+python realtime.py --width 640 --height 480
+python realtime.py --min-area 30
+python realtime.py --headless
+python realtime.py --show-mask --left-strategy rightmost --right-strategy leftmost
 ```
+
+The dual-camera selected LED uses a temporary camera-specific heuristic for the
+current glare layout: camera 0 / left preview chooses the rightmost candidate,
+and camera 1 / right preview chooses the leftmost candidate. The other candidate
+is treated as glare or reflection until calibrated stereo geometry replaces this
+rule.
 
 Stop the detector by pressing `Q` in the preview window. In headless mode, press `Ctrl+C`.
 
 Troubleshooting:
 
-- If the LED is black in the mask, loosen the HSV thresholds in `realtime_led.py`.
+- If the LED is black in the mask, loosen the HSV thresholds in `realtime.py`.
 - If too much of the image is white, tighten the HSV thresholds.
 - If the LED appears but is ignored, reduce `--min-area`.
 - If noise is selected, increase `--min-area`.

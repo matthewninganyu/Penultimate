@@ -27,6 +27,7 @@ DEFAULT_PRINT_INTERVAL_SECONDS = 1.0
 CAMERA_FORMAT = "RGB888"
 SELECTION_STRATEGIES = ("rightmost", "leftmost", "largest")
 COLOR_ORDERS = ("rgb", "bgr")
+FOV_MODES = ("full", "current")
 
 LOWER_LED = np.array([10, 150, 220], dtype=np.uint8)
 UPPER_LED = np.array([40, 255, 255], dtype=np.uint8)
@@ -74,6 +75,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-right", type=int, default=DEFAULT_CAMERA_RIGHT)
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
+    parser.add_argument(
+        "--fov-mode",
+        choices=FOV_MODES,
+        default="full",
+        help=(
+            "Use 'full' to request the widest available sensor crop and "
+            "downscale it to the preview size, or 'current' to keep "
+            "Picamera2's automatic mode choice."
+        ),
+    )
     parser.add_argument("--min-area", type=float, default=DEFAULT_MIN_AREA)
     parser.add_argument(
         "--color-order",
@@ -98,13 +109,19 @@ def parse_args() -> argparse.Namespace:
         "--left-strategy",
         choices=SELECTION_STRATEGIES,
         default=DEFAULT_LEFT_STRATEGY,
-        help="Candidate selection strategy for camera 0 / left preview.",
+        help=(
+            "Candidate selection strategy for camera 0 / left preview. "
+            "Defaults to rightmost for the current dual-camera glare layout."
+        ),
     )
     parser.add_argument(
         "--right-strategy",
         choices=SELECTION_STRATEGIES,
         default=DEFAULT_RIGHT_STRATEGY,
-        help="Candidate selection strategy for camera 1 / right preview.",
+        help=(
+            "Candidate selection strategy for camera 1 / right preview. "
+            "Defaults to leftmost for the current dual-camera glare layout."
+        ),
     )
     parser.add_argument(
         "--show-mask",
@@ -173,7 +190,62 @@ def print_available_cameras() -> list[dict[str, Any]]:
     return camera_info
 
 
-def configure_camera(camera_index: int, width: int, height: int) -> Any:
+def crop_limits_to_tuple(crop_limits: Any) -> tuple[int, int, int, int] | None:
+    if crop_limits is None:
+        return None
+
+    if all(hasattr(crop_limits, attr) for attr in ("x", "y", "width", "height")):
+        return (
+            int(crop_limits.x),
+            int(crop_limits.y),
+            int(crop_limits.width),
+            int(crop_limits.height),
+        )
+
+    try:
+        x_offset, y_offset, width, height = crop_limits
+    except (TypeError, ValueError):
+        return None
+
+    return (int(x_offset), int(y_offset), int(width), int(height))
+
+
+def crop_area(crop_limits: tuple[int, int, int, int]) -> int:
+    return crop_limits[2] * crop_limits[3]
+
+
+def find_largest_fov_sensor_mode(
+    camera: Any,
+) -> tuple[int, dict[str, Any], tuple[int, int, int, int]] | None:
+    sensor_modes = getattr(camera, "sensor_modes", None)
+    if not sensor_modes:
+        return None
+
+    largest_mode: tuple[int, dict[str, Any], tuple[int, int, int, int]] | None = None
+    for mode_index, sensor_mode in enumerate(sensor_modes):
+        crop_limits = crop_limits_to_tuple(sensor_mode.get("crop_limits"))
+        if crop_limits is None:
+            continue
+        if largest_mode is None or crop_area(crop_limits) > crop_area(largest_mode[2]):
+            largest_mode = (mode_index, sensor_mode, crop_limits)
+
+    return largest_mode
+
+
+def format_sensor_mode(sensor_mode: dict[str, Any]) -> str:
+    details = []
+    for key in ("size", "format", "bit_depth", "fps", "crop_limits"):
+        if key in sensor_mode:
+            details.append(f"{key}={sensor_mode[key]}")
+    return ", ".join(details) if details else str(sensor_mode)
+
+
+def configure_camera(
+    camera_index: int,
+    width: int,
+    height: int,
+    fov_mode: str,
+) -> tuple[Any, tuple[int, int, int, int] | None]:
     ensure_picamera2_available()
 
     try:
@@ -181,17 +253,90 @@ def configure_camera(camera_index: int, width: int, height: int) -> Any:
     except Exception as error:
         raise RuntimeError(f"Camera {camera_index} cannot be opened: {error}") from error
 
-    try:
-        video_config = camera.create_video_configuration(
-            main={"size": (width, height), "format": CAMERA_FORMAT}
-        )
-        camera.configure(video_config)
-    except Exception as error:
-        raise RuntimeError(
-            f"Camera {camera_index} cannot be configured: {error}"
-        ) from error
+    full_fov_crop = None
+    selected_mode = None
+    if fov_mode == "full":
+        selected_mode = find_largest_fov_sensor_mode(camera)
+        if selected_mode is None:
+            print(
+                f"Camera {camera_index}: no sensor mode with crop_limits was found; "
+                "falling back to Picamera2's automatic mode choice."
+            )
+        else:
+            mode_index, sensor_mode, full_fov_crop = selected_mode
+            print(
+                f"Camera {camera_index}: selected full-FOV sensor mode "
+                f"[{mode_index}] ({format_sensor_mode(sensor_mode)}), "
+                f"requested preview={width}x{height}."
+            )
 
-    return camera
+    main = {"size": (width, height), "format": CAMERA_FORMAT}
+    if selected_mode is not None:
+        try:
+            video_config = camera.create_video_configuration(
+                main=main,
+                raw=selected_mode[1],
+            )
+            camera.configure(video_config)
+        except Exception as selected_error:
+            print(
+                f"Camera {camera_index}: could not configure the selected "
+                f"full-FOV raw sensor mode ({selected_error}); using "
+                "Picamera2's automatic mode choice."
+            )
+            full_fov_crop = None
+            try:
+                video_config = camera.create_video_configuration(main=main)
+                camera.configure(video_config)
+            except Exception as fallback_error:
+                raise RuntimeError(
+                    f"Camera {camera_index} cannot be configured: {fallback_error}"
+                ) from fallback_error
+    else:
+        try:
+            video_config = camera.create_video_configuration(main=main)
+            camera.configure(video_config)
+        except Exception as error:
+            raise RuntimeError(
+                f"Camera {camera_index} cannot be configured: {error}"
+            ) from error
+
+    return camera, full_fov_crop
+
+
+def set_full_fov_crop(
+    camera: Any,
+    camera_index: int,
+    full_fov_crop: tuple[int, int, int, int] | None,
+) -> None:
+    if full_fov_crop is None:
+        return
+
+    try:
+        camera.set_controls({"ScalerCrop": full_fov_crop})
+    except Exception as error:
+        print(
+            f"Warning: Camera {camera_index} could not set full-FOV "
+            f"ScalerCrop={full_fov_crop}: {error}"
+        )
+        return
+
+    active_crop = None
+    try:
+        metadata = camera.capture_metadata()
+        active_crop = metadata.get("ScalerCrop")
+    except Exception as error:
+        print(
+            f"Warning: Camera {camera_index} could not read active ScalerCrop: {error}"
+        )
+
+    if active_crop is None:
+        print(f"Camera {camera_index}: requested ScalerCrop={full_fov_crop}.")
+    else:
+        print(
+            f"Camera {camera_index}: requested ScalerCrop={full_fov_crop}, "
+            f"active ScalerCrop={active_crop}."
+        )
 
 
 def capture_bgr_frame(
@@ -291,12 +436,12 @@ def select_physical_led(
     candidates: list[LedCandidate],
     strategy: str,
 ) -> LedCandidate | None:
-    """Select the likely physical LED using a temporary orientation heuristic.
+    """Select the likely physical LED using a camera-specific heuristic.
 
-    This is image-orientation-specific. The rightmost/leftmost rule may not
-    work identically for both cameras because the two cameras view the screen
-    from opposite sides. It will later be replaced by stereo geometry and
-    screen-plane calibration.
+    In the current dual-camera layout, one camera should use the rightmost
+    candidate and the other should use the leftmost candidate. The opposite
+    blob is treated as screen glare until calibrated stereo geometry replaces
+    this orientation rule.
     """
     if not candidates:
         return None
@@ -462,6 +607,7 @@ def run_detection(args: argparse.Namespace) -> None:
         "Starting dual realtime LED detector: "
         f"camera_left={args.camera_left}, camera_right={args.camera_right}, "
         f"resolution={args.width}x{args.height}, format={CAMERA_FORMAT}, "
+        f"fov_mode={args.fov_mode}, "
         f"min_area={args.min_area}, left_strategy={args.left_strategy}, "
         f"right_strategy={args.right_strategy}, show_mask={args.show_mask}, "
         f"headless={args.headless}, color_order={args.color_order}, "
@@ -469,11 +615,23 @@ def run_detection(args: argparse.Namespace) -> None:
     )
 
     try:
-        camera_left = configure_camera(args.camera_left, args.width, args.height)
-        camera_right = configure_camera(args.camera_right, args.width, args.height)
+        camera_left, full_fov_crop_left = configure_camera(
+            args.camera_left,
+            args.width,
+            args.height,
+            args.fov_mode,
+        )
+        camera_right, full_fov_crop_right = configure_camera(
+            args.camera_right,
+            args.width,
+            args.height,
+            args.fov_mode,
+        )
 
         camera_left.start()
         camera_right.start()
+        set_full_fov_crop(camera_left, args.camera_left, full_fov_crop_left)
+        set_full_fov_crop(camera_right, args.camera_right, full_fov_crop_right)
         time.sleep(1.0)
         print(
             "Cameras started. Sequential capture is used for this preview, "
