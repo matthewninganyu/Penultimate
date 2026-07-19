@@ -47,7 +47,7 @@ DEFAULT_CAMERA_RIGHT = 1
 DEFAULT_WIDTH = 640
 DEFAULT_HEIGHT = 480
 DEFAULT_MIN_AREA = 30.0
-DEFAULT_MIN_BRIGHTNESS = 100.0
+DEFAULT_MIN_BRIGHTNESS = 160.0
 BRIGHTNESS_STEP = 5.0
 DEFAULT_LEFT_STRATEGY = "rightmost"
 DEFAULT_RIGHT_STRATEGY = "leftmost"
@@ -383,11 +383,17 @@ def run_detection(args: argparse.Namespace) -> None:
                 frame_right, kernel, args.hsv_lower, args.hsv_upper
             )
             candidates_left = [
-                c for c in candidates_from_mask_and_frame(frame_left, mask_left, args.min_area)
+                c
+                for c in candidates_from_mask_and_frame(
+                    frame_left, mask_left, args.min_area
+                )
                 if c.peak_brightness >= min_brightness
             ]
             candidates_right = [
-                c for c in candidates_from_mask_and_frame(frame_right, mask_right, args.min_area)
+                c
+                for c in candidates_from_mask_and_frame(
+                    frame_right, mask_right, args.min_area
+                )
                 if c.peak_brightness >= min_brightness
             ]
             selected_left = select_physical_led(candidates_left, args.left_strategy)
