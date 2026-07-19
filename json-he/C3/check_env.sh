@@ -15,7 +15,7 @@ echo "python3: $($PY --version)"
 # Create venv once.
 if [ ! -d "$VENV" ]; then
   echo "creating venv $VENV ..."
-  "$PY" -m venv "$VENV"
+  "$PY" -m venv "$VENV" --system-site-packages
 fi
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
