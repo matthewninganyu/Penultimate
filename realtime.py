@@ -265,9 +265,10 @@ def coordinate_packet(
     selected_right: LedCandidate | None,
     homography: HomographyCalibration | None,
 ) -> dict[str, object]:
+    touching = selected_left is not None or selected_right is not None
     raw_packet = raw_coordinate_packet(sequence, selected_left, selected_right)
     if homography is None:
-        return raw_packet
+        return {**raw_packet, "touching": touching}
 
     mapped = map_raw_coordinates(
         point_from_candidate(selected_left),
@@ -278,6 +279,7 @@ def coordinate_packet(
         "type": "screen_coordinates",
         "sequence": sequence,
         "timestamp": raw_packet["timestamp"],
+        "touching": touching,
         "valid": bool(mapped["valid"]),
         "camera_0": raw_packet["camera_0"],
         "camera_1": raw_packet["camera_1"],
@@ -522,7 +524,7 @@ def run_detection(args: argparse.Namespace) -> None:
             packet = coordinate_packet(
                 sequence, selected_left, selected_right, homography
             )
-            if udp_socket is not None and udp_address is not None:
+            if udp_socket is not None and udp_address is not None and packet.get("valid"):
                 send_raw_udp_packet(udp_socket, udp_address, packet)
             sequence += 1
 

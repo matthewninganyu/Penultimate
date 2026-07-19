@@ -14,7 +14,7 @@ use tauri::{
 
 const TRACKPAD_OVERRIDE_DISTANCE_PX: i32 = 12;
 const TRACKPAD_OVERRIDE_MS: u64 = 1_200;
-const UDP_BIND_ADDRESS: &str = "0.0.0.0:4242";
+const UDP_BIND_ADDRESS: &str = "0.0.0.0:5005";
 const UDP_DISCONNECT_MS: u64 = 500;
 const MAX_UDP_PACKET_BYTES: usize = 2_048;
 // A backward sequence jump larger than this is treated as the sender restarting
@@ -215,6 +215,13 @@ fn spawn_udp_receiver(state: SharedState, app: AppHandle) {
         let mut rate_meter = RateMeter::new();
         let mut last_event: Option<PenInputEvent> = None;
         let mut last_invalid_packet_log: Option<Instant> = None;
+        let mut cursor_driver = Enigo::new(&Settings::default()).ok();
+        let display_size = cursor_driver
+            .as_mut()
+            .and_then(|enigo| enigo.main_display().ok());
+        let mut last_injected_position: Option<(i32, i32)> = None;
+        let mut trackpad_override_until: Option<Instant> = None;
+        let mut override_cursor_position: Option<(i32, i32)> = None;
 
         loop {
             let expired_overlay_active = {
@@ -252,6 +259,9 @@ fn spawn_udp_receiver(state: SharedState, app: AppHandle) {
                 guard.udp_peer = None;
                 last_event = None;
                 rate_meter.reset();
+                last_injected_position = None;
+                trackpad_override_until = None;
+                override_cursor_position = None;
             }
 
             let (packet_size, peer) = match socket.recv_from(&mut buffer) {
@@ -304,7 +314,7 @@ fn spawn_udp_receiver(state: SharedState, app: AppHandle) {
                 pressure: packet.pressure.map(|pressure| pressure.clamp(0.0, 1.0)),
                 timestamp,
             };
-            let overlay_active = {
+            let (overlay_active, cursor_active, trackpad_override_enabled, trackpad_drawing_enabled) = {
                 let mut guard = state.lock().expect("runtime state lock");
                 if guard
                     .udp_peer
@@ -334,12 +344,73 @@ fn spawn_udp_receiver(state: SharedState, app: AppHandle) {
                     guard.latency_ms = packet_latency(packet.timestamp.map(|value| {
                         if value >= 1_000_000_000_000.0 { value as u64 } else { (value * 1_000.0) as u64 }
                     }));
-                    guard.overlay_enabled && guard.cursor_active && !guard.trackpad_drawing_enabled
+                    (
+                        guard.overlay_enabled && guard.cursor_active && !guard.trackpad_drawing_enabled,
+                        guard.cursor_active,
+                        guard.trackpad_override_enabled,
+                        guard.trackpad_drawing_enabled,
+                    )
                 }
             };
 
+            let (ex, ey) = (event.x, event.y);
             last_event = Some(event.clone());
             emit_pen_input_for_active_surface(&app, overlay_active, event);
+
+            if cursor_active && !trackpad_drawing_enabled {
+                if let (Some(enigo), Some((width, height))) = (cursor_driver.as_mut(), display_size) {
+                    let px = (ex * f64::from(width.saturating_sub(1))).round() as i32;
+                    let py = (ey * f64::from(height.saturating_sub(1))).round() as i32;
+
+                    let mut trackpad_override_active = false;
+                    if !trackpad_override_enabled {
+                        trackpad_override_until = None;
+                        override_cursor_position = None;
+                    } else if let Some(mut until) = trackpad_override_until {
+                        if let Ok(current_pos) = enigo.location() {
+                            if override_cursor_position.is_some_and(|prev| prev != current_pos) {
+                                until = Instant::now() + Duration::from_millis(TRACKPAD_OVERRIDE_MS);
+                                trackpad_override_until = Some(until);
+                            }
+                            override_cursor_position = Some(current_pos);
+                        }
+                        if Instant::now() < until {
+                            trackpad_override_active = true;
+                        } else {
+                            trackpad_override_until = None;
+                            override_cursor_position = None;
+                            last_injected_position = None;
+                        }
+                    }
+
+                    if trackpad_override_enabled && !trackpad_override_active {
+                        if let Some((last_x, last_y)) = last_injected_position {
+                            if let Ok((cx, cy)) = enigo.location() {
+                                if (cx - last_x).abs() > TRACKPAD_OVERRIDE_DISTANCE_PX
+                                    || (cy - last_y).abs() > TRACKPAD_OVERRIDE_DISTANCE_PX
+                                {
+                                    trackpad_override_until = Some(
+                                        Instant::now() + Duration::from_millis(TRACKPAD_OVERRIDE_MS),
+                                    );
+                                    override_cursor_position = Some((cx, cy));
+                                    trackpad_override_active = true;
+                                    last_injected_position = None;
+                                }
+                            }
+                        }
+                    }
+
+                    if !trackpad_override_active {
+                        if enigo.move_mouse(px, py, Coordinate::Abs).is_ok() {
+                            last_injected_position = Some((px, py));
+                        }
+                    }
+                }
+            } else {
+                last_injected_position = None;
+                trackpad_override_until = None;
+                override_cursor_position = None;
+            }
         }
     });
 }
