@@ -25,11 +25,12 @@ from led_detection import (
     DEFAULT_HSV_UPPER,
     MORPH_KERNEL_SIZE,
     SELECTION_STRATEGIES,
+    WHITE,
     LedCandidate,
     annotate_frame,
+    candidates_from_mask_and_frame,
     coordinate_changed,
     create_led_mask,
-    find_led_candidates,
     format_candidate,
     parse_hsv_threshold,
     select_physical_led,
@@ -46,6 +47,8 @@ DEFAULT_CAMERA_RIGHT = 1
 DEFAULT_WIDTH = 640
 DEFAULT_HEIGHT = 480
 DEFAULT_MIN_AREA = 30.0
+DEFAULT_MIN_BRIGHTNESS = 100.0
+BRIGHTNESS_STEP = 5.0
 DEFAULT_LEFT_STRATEGY = "rightmost"
 DEFAULT_RIGHT_STRATEGY = "leftmost"
 DEFAULT_PRINT_INTERVAL_SECONDS = 1.0
@@ -84,6 +87,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--min-area", type=float, default=DEFAULT_MIN_AREA)
+    parser.add_argument(
+        "--min-brightness",
+        type=float,
+        default=DEFAULT_MIN_BRIGHTNESS,
+        help=(
+            "Minimum peak brightness (0-255) a candidate must have to be "
+            "considered. Adjust live with [ and ]."
+        ),
+    )
     parser.add_argument(
         "--color-order",
         choices=COLOR_ORDERS,
@@ -284,6 +296,7 @@ def run_detection(args: argparse.Namespace) -> None:
     last_printed_left: LedCandidate | None = None
     last_printed_right: LedCandidate | None = None
     csv_header_printed = False
+    min_brightness = args.min_brightness
 
     print(
         "Starting dual realtime LED detector: "
@@ -294,6 +307,7 @@ def run_detection(args: argparse.Namespace) -> None:
         f"right_strategy={args.right_strategy}, show_mask={args.show_mask}, "
         f"headless={args.headless}, color_order={args.color_order}, "
         f"hsv_lower={args.hsv_lower.tolist()}, hsv_upper={args.hsv_upper.tolist()}, "
+        f"min_brightness={args.min_brightness}, "
         f"send_udp={args.send_udp}, laptop_ip={args.laptop_ip}, "
         f"laptop_port={args.laptop_port}"
     )
@@ -368,8 +382,14 @@ def run_detection(args: argparse.Namespace) -> None:
             mask_right = create_led_mask(
                 frame_right, kernel, args.hsv_lower, args.hsv_upper
             )
-            candidates_left = find_led_candidates(mask_left, args.min_area)
-            candidates_right = find_led_candidates(mask_right, args.min_area)
+            candidates_left = [
+                c for c in candidates_from_mask_and_frame(frame_left, mask_left, args.min_area)
+                if c.peak_brightness >= min_brightness
+            ]
+            candidates_right = [
+                c for c in candidates_from_mask_and_frame(frame_right, mask_right, args.min_area)
+                if c.peak_brightness >= min_brightness
+            ]
             selected_left = select_physical_led(candidates_left, args.left_strategy)
             selected_right = select_physical_led(candidates_right, args.right_strategy)
             packet = raw_coordinate_packet(sequence, selected_left, selected_right)
@@ -412,6 +432,16 @@ def run_detection(args: argparse.Namespace) -> None:
                 frame_right, candidates_right, selected_right, "CAMERA 1", fps
             )
             combined_frame = np.hstack((annotated_left, annotated_right))
+            cv2.putText(
+                combined_frame,
+                f"Brightness >= {min_brightness:.0f}  [ / ] to adjust",
+                (12, combined_frame.shape[0] - 14),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                WHITE,
+                1,
+                cv2.LINE_AA,
+            )
             cv2.imshow(FRAME_WINDOW_NAME, combined_frame)
 
             if args.show_mask:
@@ -426,6 +456,12 @@ def run_detection(args: argparse.Namespace) -> None:
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q") or key == ord("Q"):
                 break
+            if key == ord("["):
+                min_brightness = max(0.0, min_brightness - BRIGHTNESS_STEP)
+                print(f"Min brightness: {min_brightness:.0f}")
+            if key == ord("]"):
+                min_brightness = min(255.0, min_brightness + BRIGHTNESS_STEP)
+                print(f"Min brightness: {min_brightness:.0f}")
 
             x, y = (0, 0)  # your logic here
             msg = f"{x},{y};1".encode()
