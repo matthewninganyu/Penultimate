@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
 import time
 
 import cv2
@@ -44,6 +45,7 @@ DEFAULT_LEFT_STRATEGY = "rightmost"
 DEFAULT_RIGHT_STRATEGY = "leftmost"
 DEFAULT_PRINT_INTERVAL_SECONDS = 1.0
 RAW_OUTPUT_FORMATS = ("human", "json", "csv")
+DEFAULT_LAPTOP_PORT = 5005
 
 FRAME_WINDOW_NAME = "Dual Camera LED Tracking"
 MASK_WINDOW_NAME = "Dual Camera LED Masks"
@@ -139,11 +141,29 @@ def parse_args() -> argparse.Namespace:
             "Use json or csv when feeding coordinates into another script."
         ),
     )
+    parser.add_argument(
+        "--send-udp",
+        action="store_true",
+        help="Send selected raw camera LED coordinates to the laptop over UDP.",
+    )
+    parser.add_argument(
+        "--laptop-ip",
+        default=None,
+        help="Laptop IP address for --send-udp, for example a USB/Ethernet IP.",
+    )
+    parser.add_argument(
+        "--laptop-port",
+        type=int,
+        default=DEFAULT_LAPTOP_PORT,
+        help="Laptop UDP port for --send-udp.",
+    )
     args = parser.parse_args()
     if args.camera_left is None:
         args.camera_left = args.camera
     args.hsv_lower = parse_hsv_threshold(args.hsv_lower, "--hsv-lower")
     args.hsv_upper = parse_hsv_threshold(args.hsv_upper, "--hsv-upper")
+    if args.send_udp and not args.laptop_ip:
+        parser.error("--send-udp requires --laptop-ip.")
     return args
 
 
@@ -171,6 +191,33 @@ def candidate_payload(candidate: LedCandidate | None) -> dict[str, float] | None
         "area": float(candidate.area),
         "peak_brightness": float(candidate.peak_brightness),
     }
+
+
+def raw_coordinate_packet(
+    sequence: int,
+    selected_left: LedCandidate | None,
+    selected_right: LedCandidate | None,
+) -> dict[str, object]:
+    return {
+        "type": "raw_coordinates",
+        "sequence": sequence,
+        "timestamp": time.time(),
+        "valid": selected_left is not None and selected_right is not None,
+        "camera_0": candidate_payload(selected_left),
+        "camera_1": candidate_payload(selected_right),
+    }
+
+
+def send_raw_udp_packet(
+    udp_socket: socket.socket,
+    address: tuple[str, int],
+    packet: dict[str, object],
+) -> None:
+    payload = json.dumps(packet, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    try:
+        udp_socket.sendto(payload, address)
+    except OSError as error:
+        print(f"UDP send warning: {error}")
 
 
 def print_raw_coordinates(
@@ -223,8 +270,11 @@ def run_detection(args: argparse.Namespace) -> None:
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, MORPH_KERNEL_SIZE)
     camera_left = None
     camera_right = None
+    udp_socket = None
+    udp_address = None
     last_time = time.perf_counter()
     last_print_time = 0.0
+    sequence = 0
     fps = 0.0
     last_printed_left: LedCandidate | None = None
     last_printed_right: LedCandidate | None = None
@@ -238,10 +288,17 @@ def run_detection(args: argparse.Namespace) -> None:
         f"min_area={args.min_area}, left_strategy={args.left_strategy}, "
         f"right_strategy={args.right_strategy}, show_mask={args.show_mask}, "
         f"headless={args.headless}, color_order={args.color_order}, "
-        f"hsv_lower={args.hsv_lower.tolist()}, hsv_upper={args.hsv_upper.tolist()}"
+        f"hsv_lower={args.hsv_lower.tolist()}, hsv_upper={args.hsv_upper.tolist()}, "
+        f"send_udp={args.send_udp}, laptop_ip={args.laptop_ip}, "
+        f"laptop_port={args.laptop_port}"
     )
 
     try:
+        if args.send_udp:
+            udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_address = (args.laptop_ip, args.laptop_port)
+            print(f"Sending raw coordinate UDP packets to {udp_address[0]}:{udp_address[1]}.")
+
         camera_left, full_fov_crop_left = configure_camera(
             args.camera_left,
             args.width,
@@ -308,6 +365,10 @@ def run_detection(args: argparse.Namespace) -> None:
             candidates_right = find_led_candidates(mask_right, args.min_area)
             selected_left = select_physical_led(candidates_left, args.left_strategy)
             selected_right = select_physical_led(candidates_right, args.right_strategy)
+            packet = raw_coordinate_packet(sequence, selected_left, selected_right)
+            if udp_socket is not None and udp_address is not None:
+                send_raw_udp_packet(udp_socket, udp_address, packet)
+            sequence += 1
 
             now = time.perf_counter()
             elapsed = now - last_time
@@ -363,6 +424,8 @@ def run_detection(args: argparse.Namespace) -> None:
         safe_camera_call(camera_right, "stop", "camera 1")
         safe_camera_call(camera_left, "close", "camera 0")
         safe_camera_call(camera_right, "close", "camera 1")
+        if udp_socket is not None:
+            udp_socket.close()
         cv2.destroyAllWindows()
         print("Dual realtime LED detector shut down cleanly.")
 
