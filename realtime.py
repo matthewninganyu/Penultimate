@@ -23,19 +23,35 @@ from config import (
     DEFAULT_TRACKING_CONFIDENCE_THRESHOLD,
     DEFAULT_WIDTH,
 )
-from contact_detection import ContactDetector
-from led_detection import LedDetector, parse_hsv_triplet
-from models import CameraFrame, ContactEvidence, LedCandidate, PenState, ScreenCalibration, ScreenPosition, StereoMatch
-from network_sender import UdpPenSender
-from screen_mapping import load_screen_calibration, point_to_screen_position, validate_runtime_resolution
-from stereo_matching import choose_best_stereo_match
-from tracking_filter import ExponentialPenFilter
+
+from led_detection import (
+    COORDINATE_PRINT_DELTA_PIXELS,
+    DEFAULT_HSV_LOWER,
+    DEFAULT_HSV_UPPER,
+    MORPH_KERNEL_SIZE,
+    SELECTION_STRATEGIES,
+    LedCandidate,
+    annotate_frame,
+    coordinate_changed,
+    create_led_mask,
+    find_led_candidates,
+    format_candidate,
+    parse_hsv_threshold,
+    select_physical_led,
+)
 
 
-LOGGER = logging.getLogger(__name__)
-FRAME_WINDOW_NAME = "Penultimate Tracking"
-MASK_WINDOW_NAME = "Penultimate LED Masks"
-SNAPSHOT_DIR = Path("output")
+DEFAULT_CAMERA_LEFT = 0
+DEFAULT_CAMERA_RIGHT = 1
+DEFAULT_WIDTH = 640
+DEFAULT_HEIGHT = 480
+DEFAULT_MIN_AREA = 30.0
+DEFAULT_LEFT_STRATEGY = "rightmost"
+DEFAULT_RIGHT_STRATEGY = "leftmost"
+DEFAULT_PRINT_INTERVAL_SECONDS = 1.0
+
+FRAME_WINDOW_NAME = "Dual Camera LED Tracking"
+MASK_WINDOW_NAME = "Dual Camera LED Masks"
 
 
 def parse_args() -> argparse.Namespace:
