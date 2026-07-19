@@ -35,6 +35,10 @@ from led_detection import (
     select_physical_led,
 )
 
+import socket
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+port = 5005
 
 DEFAULT_CAMERA_LEFT = 0
 DEFAULT_CAMERA_RIGHT = 1
@@ -297,7 +301,9 @@ def run_detection(args: argparse.Namespace) -> None:
         if args.send_udp:
             udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             udp_address = (args.laptop_ip, args.laptop_port)
-            print(f"Sending raw coordinate UDP packets to {udp_address[0]}:{udp_address[1]}.")
+            print(
+                f"Sending raw coordinate UDP packets to {udp_address[0]}:{udp_address[1]}."
+            )
 
         camera_left, full_fov_crop_left = configure_camera(
             args.camera_left,
@@ -419,6 +425,11 @@ def run_detection(args: argparse.Namespace) -> None:
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q") or key == ord("Q"):
                 break
+
+            x, y = (0, 0)  # your logic here
+            msg = f"{x},{y};1".encode()
+            sock.sendto(msg, ("255.255.255.255", port))
+
     finally:
         safe_camera_call(camera_left, "stop", "camera 0")
         safe_camera_call(camera_right, "stop", "camera 1")
