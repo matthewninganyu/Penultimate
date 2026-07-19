@@ -1,0 +1,18 @@
+[2026-07-19 03:30] [BUILDER]
+Built shared blue-LED detection front-end (detect.py) + black-box test on 4 real sample frames.
+Discriminator = blueness*brightness peak (rejects blue pen barrel, reflection streak, white glare).
+Replaces literal "topmost blob" (barrel sits above contact). Deps: numpy, opencv-python-headless.
+Files changed: detect.py, tests/test_detect.py, tests/fixtures/{mid,br,bl,TR}.png.
+Tests written: yes — tests/test_detect.py, ALL PASS.
+Note: tests/fixtures/TR.png appeared externally (unexplained); kept as 4th verified case.
+[2026-07-19 03:40] [BUILDER]
+Made detect.py params resolution-relative: blur sigma = 0.005*width, present-floor = normalized peak.
+Auto-scales across capture modes (fixtures/720p/full-res); verified <0.04% normalized centroid drift.
+Files changed: detect.py. Tests: test_detect.py still ALL PASS.
+[2026-07-19 04:10] [BUILDER]
+Built A + B position solvers via parallel agents; re-ran both tests to confirm (independent).
+A (two-bearing): PASS. interior 0.35mm, edge 0.23mm, top-strip 0.50mm bounded, GDOP 7.63; tilt-bias ceiling 0.36mm.
+B (homography): PASS 7/7. distortion recovery ~2e-5mm; no-undistort baseline 2.56mm (teeth ok); single-cam fallback ok; R1 edge/int ~1.3x.
+KEY FINDING: at the ~2deg grazing mount, B's homography Jacobian is ill-conditioned -> +/-0.3px centroid noise = 2.4mm mean / 7mm max (blows budget). A same-noise ~0.35mm. A more noise-robust at the built rig; B needs less-grazing vantage or sub-0.05px centroids.
+Files: A_triangulation/{position,test_position}.py, B_homography/{position,test_position}.py.
+Tests written: yes, both PASS. NOTE: A and B use separate synthetic models (not a shared harness) - gap is qualitative but large + physically sensible.
