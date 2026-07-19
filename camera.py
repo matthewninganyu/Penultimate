@@ -20,10 +20,10 @@ FOV_MODES = ("full", "current")
 # controls only -- reapplied every process start via apply_led_controls().
 # Sweep EXPOSURE_TIME_US (100..8000) on hardware to find where the LED core
 # turns blue and ambient goes near-black. Capped under ~10000us at 100 FPS.
-EXPOSURE_TIME_US = 1000
+EXPOSURE_TIME_US = 750
 ANALOGUE_GAIN = 1.0
 COLOUR_GAINS = (2.0, 2.0)  # (red, blue) manual WB gains; tune so blue reads blue
-LENS_POSITION = 4.5  # dioptres (1/m); set for the fixed working distance
+LENS_POSITION = 5  # dioptres (1/m); set for the fixed working distance
 
 
 def ensure_picamera2_available() -> None:
