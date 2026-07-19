@@ -4,8 +4,8 @@ Both show_grid.py (Mac display) and capture_calib.py (Pi logger) import this so
 the two machines agree on dot positions AND order. Order is boustrophedon (snake)
 so the operator taps with minimal travel and pen-up gaps mark tap boundaries.
 """
-GRID_COLS = 7
-GRID_ROWS = 5
+GRID_COLS = 3
+GRID_ROWS = 3
 MARGIN = 0.04  # keep dots off the extreme bezel but still sample the edges
 
 # taps_cam{N}.csv columns (one row per captured dot per camera)
