@@ -25,3 +25,32 @@ Full makeover for dark-exposure imaging (Ae/Awb off, 800us).
 - Removed superseded live_detect.py.
 Files: detect.py, tests/test_detect.py, tests/fixtures/*, live_dual.py, plot_jitter.py.
 Tests: detect ALL PASS; plotter smoke-tested. live_dual needs Pi (picamera2) to run.
+[2026-07-19 07:40] [BUILDER]
+Phase 1 calibration capture harness (shared, both candidates):
+- calib_grid.py: 35-dot (7x5) snake grid to edges, normalized [0,1] + tap CSV schema.
+- capture_calib.py (Pi): dual-cam, sequential stable-tap auto-capture -> taps_cam{0,1}.csv; --checkerboard mode -> calib_imgs/. Reuses live_dual locked-exposure setup + detect.
+- show_grid.py (Mac): tkinter fullscreen numbered dot grid (tap surface).
+Decision: GT (x,y) = displayed-dot tap, normalized coords; Pi-driven, Mac static grid, no networking.
+Phase 2 (A-fit, B-fit calibrate.py) delegated to parallel subagents against the taps schema.
+Files: calib_grid.py, capture_calib.py, show_grid.py. Compile OK, grid verified.
+[2026-07-19 08:15] [BUILDER]
+Phase 2 calibrate.py: both subagents died mid-task (session limit) after writing calibrate.py but BEFORE tests. Overseer verified + finished.
+- A_triangulation/calibrate.py: 1-D u->bearing poly fit + screen_config.yaml. Reviewed: load_config keys match solve() exactly.
+- B_homography/calibrate.py: pinhole+fisheye intrinsics (lower-RMS wins) + findHomography(undistorted->screen_px). load_calib matches solve().
+- Wrote missing test_calibrate.py for both (integration: synth taps -> fit -> load -> solve held-out).
+Results: A mean 0.045mm / max 0.32mm PASS. B homography path mean 1.54mm / max 4.8mm PASS (grazing-mount noise amplification, consistent w/ prior finding).
+B intrinsics recovery NOT synthetically tested (stock cv2; synthetic checkerboard too crude for findChessboardCorners) -> validated on-rig w/ real boards (R1 gate). test covers no-images graceful skip + homography round-trip.
+Files: A+B calibrate.py (from agents, verified), A+B test_calibrate.py (overseer).
+
+[2026-07-19 08:45] [BUILDER]
+Committed to Candidate A; B dropped (grazing-mount noise amplification, 7mm max vs A 0.35mm).
+- Archived B_homography/ -> archive/ (recoverable, no git safety net).
+- Stripped B-only code from shared harness: removed capture_calib checkerboard mode
+  (_capture_checkerboard, --checkerboard, unused sys/os/time imports); reworded calib_grid
+  + capture_calib docstrings A-only.
+- Swept returned clutter: tests/fixtures/.DS_Store, dual_log.csv, stray screenshot png.
+- Recorded decision in PROJECT.md Key Decisions.
+Review findings resolution: both HIGH items were B-specific -> resolved by dropping B.
+capture "needs both cams" is CORRECT for A (one bearing unsolvable). Delta-t unified at 8000us.
+Rig-time TODO (unchanged): verify top-half has no LED-outshining blue on real 720p frames.
+Tests: detect + A position + A calibrate ALL PASS. Harness compiles.

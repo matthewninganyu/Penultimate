@@ -139,6 +139,10 @@ With cameras **in sync** and glare removed by in-plane mounting, the two biggest
 - Ethernet transport vs parent's USB-C serial — reconcile in C4/C6.
 
 ## Key Decisions
+- [2026-07-19] **COMMITTED TO A (two-bearing triangulation). B (homography) dropped** — at the ~2° grazing
+  mount B's homography Jacobian is ill-conditioned: ±0.3px centroid noise → 2.4mm mean / 7mm max (blows
+  the ≤5mm budget); A same-noise ~0.35mm. B archived to `archive/B_homography/` (recoverable if A fails on
+  the real rig). Shared harness stripped of B-only checkerboard/intrinsics capture.
 - [2026-07-18] **In-plane grazing mount** — presents near-zero reflective area, structurally eliminates
   glare; demotes modulation to backup, makes continuous LED + tip-switch primary.
 - [2026-07-18] **Two-bearing intersection (u-only), Method A** — undistort → pixel→bearing → cast from
