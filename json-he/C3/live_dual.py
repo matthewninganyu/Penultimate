@@ -11,6 +11,7 @@ and the per-pair offset dt is shown + logged. Logs every pair to dual_log.csv fo
 triangulation + jitter analysis. Press 'q' to quit.
 """
 import csv
+import os
 import sys
 import time
 
@@ -18,70 +19,49 @@ import cv2
 
 from detect import detect
 
-# --- locked camera settings (from bench tuning) ---
-EXPOSURE_TIME_US = 800
-ANALOGUE_GAIN = 1.0
-COLOUR_GAINS = (2.0, 2.0)
-LENS_POSITION = 5.0
-SIZE = (1280, 720)
-FPS = 100.0
+# Shared camera module (../Penultimate/camera.py) — full-FOV sensor mode +
+# ScalerCrop + locked exposure/AWB/focus live there; C3 reuses it, no duplication.
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "Penultimate"))
+try:
+    import camera as cam
+except ImportError as e:  # pragma: no cover
+    raise SystemExit(
+        "cannot import ../Penultimate/camera.py — ensure the full repo is on the "
+        f"Pi, not just C3/. ({e})")
+
+SIZE = (1280, 720)     # preview size (full FOV is downscaled INTO this via ScalerCrop)
 DT_MAX_US = 8000       # accept a pair only if |SensorTimestamp0 - 1| < this
 SWAP_RB = False        # set True if the LED shows RED / detection fails (RGB<->BGR)
 DISPLAY_W = 1600       # downscale the side-by-side view to fit the screen
 
 
-def apply_led_controls(camera, camera_index):
-    """Lock exposure/AWB/focus so the two cameras stay deterministic + in step.
-    libcamera is Pi-only -> imported lazily so this module still imports on Mac.
-    """
-    from libcamera import controls
-    ctrls = {
-        "AeEnable": False,          # no auto-exposure re-metering (drifts sync)
-        "AwbEnable": False,         # lock white balance -> stable blue hue
-        "AnalogueGain": ANALOGUE_GAIN,
-        "ColourGains": COLOUR_GAINS,
-        "ExposureTime": EXPOSURE_TIME_US,
-    }
-    try:
-        ctrls["AfMode"] = controls.AfModeEnum.Manual
-        ctrls["LensPosition"] = LENS_POSITION
-    except Exception:
-        pass
-    try:
-        ctrls["HdrMode"] = controls.HdrModeEnum.Off  # single exposure, no merge
-    except Exception:
-        pass
-    camera.set_controls(ctrls)
-
-
 def open_cams():
-    from picamera2 import Picamera2
+    """Open both cameras at FULL sensor FOV with locked LED controls (camera.py)."""
     cams = []
     for i in range(2):
-        p = Picamera2(i)
-        cfg = p.create_video_configuration(
-            main={"size": SIZE, "format": "RGB888"},
-            controls={"FrameRate": FPS},
-        )
-        p.configure(cfg)
-        p.start()
-        apply_led_controls(p, i)
-        cams.append(p)
-    print(f"opened {len(cams)} cameras @ {SIZE} {FPS}fps")
+        c, full_fov_crop = cam.configure_camera(i, SIZE[0], SIZE[1], fov_mode="full")
+        c.start()
+        cam.apply_led_controls(c, i)          # exposure/AWB/focus lock
+        cam.set_full_fov_crop(c, i, full_fov_crop)  # show the WHOLE lens view
+        cams.append(c)
+    print(f"opened {len(cams)} cameras @ full FOV, preview {SIZE}")
     return cams
 
 
-def grab(cam):
-    """Return (bgr_frame, sensor_timestamp_ns) for one camera, same frame."""
-    req = cam.capture_request()
+def grab(camera_obj):
+    """Return (bgr_frame, sensor_timestamp_ns) for one camera, same frame.
+
+    Camera is configured RGB888 -> convert to BGR for detect()/imshow. SWAP_RB
+    flips it if a given setup delivers the opposite order (LED shows red).
+    """
+    req = camera_obj.capture_request()
     try:
-        arr = req.make_array("main")
+        arr = req.make_array("main")           # RGB888
         ts = req.get_metadata().get("SensorTimestamp", 0)
     finally:
         req.release()
-    if SWAP_RB:
-        arr = arr[..., ::-1].copy()
-    return arr, ts
+    bgr = arr if SWAP_RB else cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    return bgr, ts
 
 
 def annotate(bgr, res, label):
