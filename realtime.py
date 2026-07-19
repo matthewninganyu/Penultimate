@@ -54,7 +54,7 @@ DEFAULT_LEFT_STRATEGY = "rightmost"
 DEFAULT_RIGHT_STRATEGY = "leftmost"
 DEFAULT_PRINT_INTERVAL_SECONDS = 1.0
 RAW_OUTPUT_FORMATS = ("human", "json", "csv")
-DEFAULT_BROADCAST_IP = "255.255.255.255"
+DEFAULT_BROADCAST_IP = "169.254.255.255"
 DEFAULT_LAPTOP_PORT = 5005
 
 FRAME_WINDOW_NAME = "Dual Camera LED Tracking"
@@ -312,8 +312,16 @@ def print_coordinate_packet(
         right_y = "" if camera_1 is None else f"{camera_1['y']:.3f}"
         pixel_x = "" if packet.get("pixel_x") is None else str(packet["pixel_x"])
         pixel_y = "" if packet.get("pixel_y") is None else str(packet["pixel_y"])
-        normalized_x = "" if packet.get("normalized_x") is None else f"{packet['normalized_x']:.6f}"
-        normalized_y = "" if packet.get("normalized_y") is None else f"{packet['normalized_y']:.6f}"
+        normalized_x = (
+            ""
+            if packet.get("normalized_x") is None
+            else f"{packet['normalized_x']:.6f}"
+        )
+        normalized_y = (
+            ""
+            if packet.get("normalized_y") is None
+            else f"{packet['normalized_y']:.6f}"
+        )
         print(
             f"{packet['timestamp']:.6f},{left_x},{left_y},{right_x},{right_y},"
             f"{packet['valid']},{pixel_x},{pixel_y},{normalized_x},{normalized_y}"
@@ -396,7 +404,10 @@ def run_detection(args: argparse.Namespace) -> None:
 
         if not args.raw_only:
             homography = load_homography_calibration(args.homography)
-            if homography.image_width != args.width or homography.image_height != args.height:
+            if (
+                homography.image_width != args.width
+                or homography.image_height != args.height
+            ):
                 raise RuntimeError(
                     "Homography calibration resolution mismatch: "
                     f"calibration={homography.image_width}x{homography.image_height}, "
@@ -483,7 +494,9 @@ def run_detection(args: argparse.Namespace) -> None:
             ]
             selected_left = select_physical_led(candidates_left, args.left_strategy)
             selected_right = select_physical_led(candidates_right, args.right_strategy)
-            packet = coordinate_packet(sequence, selected_left, selected_right, homography)
+            packet = coordinate_packet(
+                sequence, selected_left, selected_right, homography
+            )
             if udp_socket is not None and udp_address is not None:
                 send_raw_udp_packet(udp_socket, udp_address, packet)
             sequence += 1
