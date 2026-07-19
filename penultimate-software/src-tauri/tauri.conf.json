@@ -1,0 +1,115 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Penultimate",
+  "version": "0.1.0",
+    "identifier": "com.lifengyin.penultimate",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "notebook",
+        "title": "",
+        "width": 960,
+        "height": 680,
+        "minWidth": 720,
+        "minHeight": 520,
+        "visible": false,
+        "focus": false,
+        "theme": "Light",
+        "decorations": true,
+        "titleBarStyle": "Overlay",
+        "trafficLightPosition": { "x": 14, "y": 28 },
+        "hiddenTitle": true,
+        "transparent": false,
+        "backgroundColor": "#F7F8FA",
+        "acceptFirstMouse": true,
+        "shadow": true,
+        "alwaysOnTop": false,
+        "resizable": true
+      },
+      {
+        "label": "toolbar",
+        "title": "Penultimate Annotation Tools",
+        "width": 690,
+        "height": 116,
+        "y": 40,
+        "visible": false,
+        "focus": false,
+        "decorations": false,
+        "transparent": true,
+        "backgroundColor": "#00000000",
+        "acceptFirstMouse": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "resizable": false
+      },
+      {
+        "label": "overlay",
+        "title": "Penultimate Annotation",
+        "width": 1280,
+        "height": 800,
+        "visible": false,
+        "focus": false,
+        "decorations": false,
+        "transparent": true,
+        "backgroundColor": "#00000000",
+        "acceptFirstMouse": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "resizable": false
+      },
+      {
+        "label": "status",
+        "title": "",
+        "width": 190,
+        "height": 38,
+        "visible": true,
+        "focus": false,
+        "focusable": false,
+        "decorations": false,
+        "transparent": true,
+        "backgroundColor": "#00000000",
+        "acceptFirstMouse": false,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "resizable": false,
+        "skipTaskbar": true
+      },
+      {
+        "label": "calibration",
+        "title": "Calibrate Penultimate",
+        "width": 1280,
+        "height": 800,
+        "visible": false,
+        "focus": true,
+        "decorations": false,
+        "transparent": false,
+        "backgroundColor": "#080B10",
+        "acceptFirstMouse": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "resizable": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}
