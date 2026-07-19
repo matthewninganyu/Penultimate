@@ -20,7 +20,7 @@ from camera import (
     safe_camera_call,
     set_full_fov_crop,
 )
-from led_detection import (
+from blue_led_detection import (
     COORDINATE_PRINT_DELTA_PIXELS,
     DEFAULT_HSV_LOWER,
     DEFAULT_HSV_UPPER,
@@ -110,12 +110,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hsv-lower",
         default="100,150,180",
-        help="Lower HSV blue LED threshold as H,S,V.",
+        help="Lower HSV blue halo threshold as H,S,V.",
     )
     parser.add_argument(
         "--hsv-upper",
         default="130,255,255",
-        help="Upper HSV blue LED threshold as H,S,V.",
+        help="Upper HSV blue halo threshold as H,S,V.",
+    )
+    parser.add_argument(
+        "--roi-start",
+        type=float,
+        default=0.45,
+        help="Top of the detector ROI as a frame-height fraction.",
+    )
+    parser.add_argument(
+        "--roi-end",
+        type=float,
+        default=0.85,
+        help="Bottom of the detector ROI as a frame-height fraction.",
     )
     parser.add_argument(
         "--left-strategy",
@@ -195,6 +207,8 @@ def parse_args() -> argparse.Namespace:
         args.camera_left = args.camera
     args.hsv_lower = parse_hsv_threshold(args.hsv_lower, "--hsv-lower")
     args.hsv_upper = parse_hsv_threshold(args.hsv_upper, "--hsv-upper")
+    if not 0.0 <= args.roi_start < args.roi_end <= 1.0:
+        parser.error("--roi-start and --roi-end must satisfy 0 <= start < end <= 1.")
     return args
 
 
@@ -380,6 +394,7 @@ def run_detection(args: argparse.Namespace) -> None:
         f"right_strategy={args.right_strategy}, show_mask={args.show_mask}, "
         f"headless={args.headless}, color_order={args.color_order}, "
         f"hsv_lower={args.hsv_lower.tolist()}, hsv_upper={args.hsv_upper.tolist()}, "
+        f"roi_start={args.roi_start}, roi_end={args.roi_end}, "
         f"min_brightness={args.min_brightness}, "
         f"send_udp={args.send_udp}, laptop_ip={args.laptop_ip}, "
         f"laptop_port={args.laptop_port}"
@@ -462,10 +477,20 @@ def run_detection(args: argparse.Namespace) -> None:
                 frame_right = ensure_frame_size(frame_right, args.width, args.height)
 
             mask_left = create_led_mask(
-                frame_left, kernel, args.hsv_lower, args.hsv_upper
+                frame_left,
+                kernel,
+                args.hsv_lower,
+                args.hsv_upper,
+                args.roi_start,
+                args.roi_end,
             )
             mask_right = create_led_mask(
-                frame_right, kernel, args.hsv_lower, args.hsv_upper
+                frame_right,
+                kernel,
+                args.hsv_lower,
+                args.hsv_upper,
+                args.roi_start,
+                args.roi_end,
             )
             candidates_left = [
                 c
