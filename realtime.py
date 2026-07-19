@@ -94,13 +94,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--hsv-lower",
-        default=",".join(str(v) for v in DEFAULT_HSV_LOWER.tolist()),
-        help="Lower HSV LED threshold as H,S,V.",
+        default="100,150,180",
+        help="Lower HSV blue LED threshold as H,S,V.",
     )
     parser.add_argument(
         "--hsv-upper",
-        default=",".join(str(v) for v in DEFAULT_HSV_UPPER.tolist()),
-        help="Upper HSV LED threshold as H,S,V.",
+        default="130,255,255",
+        help="Upper HSV blue LED threshold as H,S,V.",
     )
     parser.add_argument(
         "--left-strategy",
