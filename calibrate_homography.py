@@ -18,7 +18,7 @@ from camera import (
     set_full_fov_crop,
 )
 from config import DEFAULT_HEIGHT, DEFAULT_MIN_AREA, DEFAULT_WIDTH
-from led_detection import LedDetector, parse_hsv_threshold
+from blue_led_detection import LedDetector, parse_hsv_threshold
 from models import LedCandidate
 from screen_mapper import (
     DEFAULT_HOMOGRAPHY_CALIBRATION,
@@ -54,8 +54,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--screen-height-px", type=int, required=True)
     parser.add_argument("--output", type=Path, default=DEFAULT_HOMOGRAPHY_CALIBRATION)
     parser.add_argument("--min-area", type=float, default=DEFAULT_MIN_AREA)
-    parser.add_argument("--hsv-lower", default="100,150,180", help="Lower HSV LED threshold as H,S,V.")
-    parser.add_argument("--hsv-upper", default="130,255,255", help="Upper HSV LED threshold as H,S,V.")
+    parser.add_argument("--hsv-lower", default="100,150,180", help="Lower HSV blue halo threshold as H,S,V.")
+    parser.add_argument("--hsv-upper", default="130,255,255", help="Upper HSV blue halo threshold as H,S,V.")
     parser.add_argument("--samples-per-corner", type=int, default=DEFAULT_SAMPLES_PER_CORNER)
     parser.add_argument("--stable-window", type=int, default=DEFAULT_STABLE_WINDOW)
     parser.add_argument("--stable-std-px", type=float, default=DEFAULT_STABLE_STD_PX)

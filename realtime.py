@@ -20,7 +20,7 @@ from camera import (
     safe_camera_call,
     set_full_fov_crop,
 )
-from led_detection import (
+from blue_led_detection import (
     COORDINATE_PRINT_DELTA_PIXELS,
     DEFAULT_HSV_LOWER,
     DEFAULT_HSV_UPPER,
@@ -54,7 +54,7 @@ DEFAULT_LEFT_STRATEGY = "rightmost"
 DEFAULT_RIGHT_STRATEGY = "leftmost"
 DEFAULT_PRINT_INTERVAL_SECONDS = 1.0
 RAW_OUTPUT_FORMATS = ("human", "json", "csv")
-DEFAULT_BROADCAST_IP = "255.255.255.255"
+DEFAULT_BROADCAST_IP = "169.254.255.255"
 DEFAULT_LAPTOP_PORT = 5005
 
 FRAME_WINDOW_NAME = "Dual Camera LED Tracking"
@@ -110,12 +110,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hsv-lower",
         default="100,150,180",
-        help="Lower HSV blue LED threshold as H,S,V.",
+        help="Lower HSV blue halo threshold as H,S,V.",
     )
     parser.add_argument(
         "--hsv-upper",
         default="130,255,255",
-        help="Upper HSV blue LED threshold as H,S,V.",
+        help="Upper HSV blue halo threshold as H,S,V.",
+    )
+    parser.add_argument(
+        "--roi-start",
+        type=float,
+        default=0.45,
+        help="Top of the detector ROI as a frame-height fraction.",
+    )
+    parser.add_argument(
+        "--roi-end",
+        type=float,
+        default=0.85,
+        help="Bottom of the detector ROI as a frame-height fraction.",
     )
     parser.add_argument(
         "--left-strategy",
@@ -195,6 +207,8 @@ def parse_args() -> argparse.Namespace:
         args.camera_left = args.camera
     args.hsv_lower = parse_hsv_threshold(args.hsv_lower, "--hsv-lower")
     args.hsv_upper = parse_hsv_threshold(args.hsv_upper, "--hsv-upper")
+    if not 0.0 <= args.roi_start < args.roi_end <= 1.0:
+        parser.error("--roi-start and --roi-end must satisfy 0 <= start < end <= 1.")
     return args
 
 
@@ -251,9 +265,10 @@ def coordinate_packet(
     selected_right: LedCandidate | None,
     homography: HomographyCalibration | None,
 ) -> dict[str, object]:
+    touching = selected_left is not None or selected_right is not None
     raw_packet = raw_coordinate_packet(sequence, selected_left, selected_right)
     if homography is None:
-        return raw_packet
+        return {**raw_packet, "touching": touching}
 
     mapped = map_raw_coordinates(
         point_from_candidate(selected_left),
@@ -264,6 +279,7 @@ def coordinate_packet(
         "type": "screen_coordinates",
         "sequence": sequence,
         "timestamp": raw_packet["timestamp"],
+        "touching": touching,
         "valid": bool(mapped["valid"]),
         "camera_0": raw_packet["camera_0"],
         "camera_1": raw_packet["camera_1"],
@@ -312,8 +328,16 @@ def print_coordinate_packet(
         right_y = "" if camera_1 is None else f"{camera_1['y']:.3f}"
         pixel_x = "" if packet.get("pixel_x") is None else str(packet["pixel_x"])
         pixel_y = "" if packet.get("pixel_y") is None else str(packet["pixel_y"])
-        normalized_x = "" if packet.get("normalized_x") is None else f"{packet['normalized_x']:.6f}"
-        normalized_y = "" if packet.get("normalized_y") is None else f"{packet['normalized_y']:.6f}"
+        normalized_x = (
+            ""
+            if packet.get("normalized_x") is None
+            else f"{packet['normalized_x']:.6f}"
+        )
+        normalized_y = (
+            ""
+            if packet.get("normalized_y") is None
+            else f"{packet['normalized_y']:.6f}"
+        )
         print(
             f"{packet['timestamp']:.6f},{left_x},{left_y},{right_x},{right_y},"
             f"{packet['valid']},{pixel_x},{pixel_y},{normalized_x},{normalized_y}"
@@ -380,6 +404,7 @@ def run_detection(args: argparse.Namespace) -> None:
         f"right_strategy={args.right_strategy}, show_mask={args.show_mask}, "
         f"headless={args.headless}, color_order={args.color_order}, "
         f"hsv_lower={args.hsv_lower.tolist()}, hsv_upper={args.hsv_upper.tolist()}, "
+        f"roi_start={args.roi_start}, roi_end={args.roi_end}, "
         f"min_brightness={args.min_brightness}, "
         f"send_udp={args.send_udp}, laptop_ip={args.laptop_ip}, "
         f"laptop_port={args.laptop_port}"
@@ -396,7 +421,10 @@ def run_detection(args: argparse.Namespace) -> None:
 
         if not args.raw_only:
             homography = load_homography_calibration(args.homography)
-            if homography.image_width != args.width or homography.image_height != args.height:
+            if (
+                homography.image_width != args.width
+                or homography.image_height != args.height
+            ):
                 raise RuntimeError(
                     "Homography calibration resolution mismatch: "
                     f"calibration={homography.image_width}x{homography.image_height}, "
@@ -462,10 +490,20 @@ def run_detection(args: argparse.Namespace) -> None:
                 frame_right = ensure_frame_size(frame_right, args.width, args.height)
 
             mask_left = create_led_mask(
-                frame_left, kernel, args.hsv_lower, args.hsv_upper
+                frame_left,
+                kernel,
+                args.hsv_lower,
+                args.hsv_upper,
+                args.roi_start,
+                args.roi_end,
             )
             mask_right = create_led_mask(
-                frame_right, kernel, args.hsv_lower, args.hsv_upper
+                frame_right,
+                kernel,
+                args.hsv_lower,
+                args.hsv_upper,
+                args.roi_start,
+                args.roi_end,
             )
             candidates_left = [
                 c
@@ -483,8 +521,10 @@ def run_detection(args: argparse.Namespace) -> None:
             ]
             selected_left = select_physical_led(candidates_left, args.left_strategy)
             selected_right = select_physical_led(candidates_right, args.right_strategy)
-            packet = coordinate_packet(sequence, selected_left, selected_right, homography)
-            if udp_socket is not None and udp_address is not None:
+            packet = coordinate_packet(
+                sequence, selected_left, selected_right, homography
+            )
+            if udp_socket is not None and udp_address is not None and packet.get("valid"):
                 send_raw_udp_packet(udp_socket, udp_address, packet)
             sequence += 1
 

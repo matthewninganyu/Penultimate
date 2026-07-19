@@ -12,7 +12,7 @@ from camera import (
     safe_camera_call,
     set_full_fov_crop,
 )
-from led_detection import (
+from blue_led_detection import (
     COORDINATE_PRINT_DELTA_PIXELS,
     DEFAULT_HSV_LOWER,
     DEFAULT_HSV_UPPER,

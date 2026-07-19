@@ -7,3 +7,6 @@ __pycache__/
 .mypy_cache/
 calibration*
 calibration*/*
+wheels/
+output/
+photos/

@@ -21,7 +21,7 @@ from config import (
     DEFAULT_SCREEN_CALIBRATION,
     DEFAULT_WIDTH,
 )
-from led_detection import LedDetector, parse_hsv_triplet
+from blue_led_detection import LedDetector, parse_hsv_triplet
 from models import LedCandidate
 from screen_mapping import load_intrinsics
 
@@ -48,10 +48,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stable-std-px", type=float, default=1.8)
     parser.add_argument("--max-frame-skew-ms", type=float, default=DEFAULT_MAX_FRAME_SKEW_MS)
     parser.add_argument("--min-area", type=float, default=DEFAULT_MIN_AREA)
-    parser.add_argument("--lower-h", type=int, default=10)
+    parser.add_argument("--lower-h", type=int, default=100)
     parser.add_argument("--lower-s", type=int, default=150)
-    parser.add_argument("--lower-v", type=int, default=220)
-    parser.add_argument("--upper-h", type=int, default=40)
+    parser.add_argument("--lower-v", type=int, default=180)
+    parser.add_argument("--upper-h", type=int, default=130)
     parser.add_argument("--upper-s", type=int, default=255)
     parser.add_argument("--upper-v", type=int, default=255)
     parser.add_argument("--show-mask", action="store_true")
