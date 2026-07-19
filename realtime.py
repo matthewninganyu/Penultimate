@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
 
 import cv2
@@ -42,6 +43,7 @@ DEFAULT_MIN_AREA = 30.0
 DEFAULT_LEFT_STRATEGY = "rightmost"
 DEFAULT_RIGHT_STRATEGY = "leftmost"
 DEFAULT_PRINT_INTERVAL_SECONDS = 1.0
+RAW_OUTPUT_FORMATS = ("human", "json", "csv")
 
 FRAME_WINDOW_NAME = "Dual Camera LED Tracking"
 MASK_WINDOW_NAME = "Dual Camera LED Masks"
@@ -128,6 +130,15 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_PRINT_INTERVAL_SECONDS,
         help="Maximum seconds between headless coordinate updates.",
     )
+    parser.add_argument(
+        "--raw-output",
+        choices=RAW_OUTPUT_FORMATS,
+        default="human",
+        help=(
+            "Format for selected raw camera LED coordinates printed to stdout. "
+            "Use json or csv when feeding coordinates into another script."
+        ),
+    )
     args = parser.parse_args()
     if args.camera_left is None:
         args.camera_left = args.camera
@@ -151,6 +162,55 @@ def should_print_coordinates(
     return time.perf_counter() - last_print_time >= print_interval
 
 
+def candidate_payload(candidate: LedCandidate | None) -> dict[str, float] | None:
+    if candidate is None:
+        return None
+    return {
+        "x": float(candidate.x),
+        "y": float(candidate.y),
+        "area": float(candidate.area),
+        "peak_brightness": float(candidate.peak_brightness),
+    }
+
+
+def print_raw_coordinates(
+    selected_left: LedCandidate | None,
+    selected_right: LedCandidate | None,
+    raw_output: str,
+    csv_header_printed: bool,
+) -> bool:
+    timestamp = time.time()
+    if raw_output == "json":
+        print(
+            json.dumps(
+                {
+                    "timestamp": timestamp,
+                    "camera_0": candidate_payload(selected_left),
+                    "camera_1": candidate_payload(selected_right),
+                },
+                separators=(",", ":"),
+            )
+        )
+        return csv_header_printed
+
+    if raw_output == "csv":
+        if not csv_header_printed:
+            print("timestamp,camera_0_x,camera_0_y,camera_1_x,camera_1_y")
+            csv_header_printed = True
+        left_x = "" if selected_left is None else f"{selected_left.x:.3f}"
+        left_y = "" if selected_left is None else f"{selected_left.y:.3f}"
+        right_x = "" if selected_right is None else f"{selected_right.x:.3f}"
+        right_y = "" if selected_right is None else f"{selected_right.y:.3f}"
+        print(f"{timestamp:.6f},{left_x},{left_y},{right_x},{right_y}")
+        return csv_header_printed
+
+    print(
+        f"Camera 0: {format_candidate(selected_left)} | "
+        f"Camera 1: {format_candidate(selected_right)}"
+    )
+    return csv_header_printed
+
+
 def run_detection(args: argparse.Namespace) -> None:
     camera_info = print_available_cameras()
     if len(camera_info) < 2:
@@ -168,6 +228,7 @@ def run_detection(args: argparse.Namespace) -> None:
     fps = 0.0
     last_printed_left: LedCandidate | None = None
     last_printed_right: LedCandidate | None = None
+    csv_header_printed = False
 
     print(
         "Starting dual realtime LED detector: "
@@ -263,9 +324,11 @@ def run_detection(args: argparse.Namespace) -> None:
                 last_print_time,
                 args.print_interval,
             ):
-                print(
-                    f"Camera 0: {format_candidate(selected_left)} | "
-                    f"Camera 1: {format_candidate(selected_right)}"
+                csv_header_printed = print_raw_coordinates(
+                    selected_left,
+                    selected_right,
+                    args.raw_output,
+                    csv_header_printed,
                 )
                 last_print_time = now
                 last_printed_left = selected_left
