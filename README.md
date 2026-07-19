@@ -78,6 +78,27 @@ The screen coordinate system is top-left origin, +X right, +Y down, +Z outward f
 
 During screen calibration, touch each instructed location with the LED tip and hold still. The program collects stable samples from both cameras, estimates each camera pose with planar PnP, builds projection matrices, validates reprojection error, and writes `calibration/screen_calibration.npz`.
 
+For the realtime homography mapper, run the 9-target calibration:
+
+```bash
+python calibrate_homography.py \
+    --screen-width-px 1920 \
+    --screen-height-px 1080 \
+    --show-mask
+```
+
+This collects top/middle/bottom targets instead of only four corners. By default, camera 0 skips the top-left target and camera 1 skips the top-right target, which avoids training on oversized LED blobs near the physical cameras. It writes `calibration/screen_homography.npz`.
+
+Optional: write a screen-sized target image first:
+
+```bash
+python calibrate_homography.py \
+    --screen-width-px 1920 \
+    --screen-height-px 1080 \
+    --target-image output/homography_targets_9.png \
+    --write-target-only
+```
+
 ## Runtime
 
 Primary calibrated preview:

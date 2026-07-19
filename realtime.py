@@ -50,6 +50,7 @@ DEFAULT_WIDTH = 640
 DEFAULT_HEIGHT = 480
 DEFAULT_MIN_AREA = 30.0
 DEFAULT_MIN_BRIGHTNESS = 160.0
+DEFAULT_MAX_SCREEN_DISAGREEMENT_PX = 160.0
 BRIGHTNESS_STEP = 5.0
 DEFAULT_LEFT_STRATEGY = "rightmost"
 DEFAULT_RIGHT_STRATEGY = "leftmost"
@@ -185,6 +186,16 @@ def parse_args() -> argparse.Namespace:
         help="Saved calibration from calibrate_homography.py.",
     )
     parser.add_argument(
+        "--max-screen-disagreement-px",
+        type=float,
+        default=DEFAULT_MAX_SCREEN_DISAGREEMENT_PX,
+        help=(
+            "When the two mapped camera estimates disagree by more than this "
+            "many screen pixels, prefer the camera with the smaller LED blob. "
+            "Use 0 to disable."
+        ),
+    )
+    parser.add_argument(
         "--send-udp",
         action="store_true",
         help="Send selected coordinates to the laptop over UDP.",
@@ -260,11 +271,18 @@ def point_from_candidate(candidate: LedCandidate | None) -> np.ndarray | None:
     return candidate.image_point()
 
 
+def mapping_confidence(candidate: LedCandidate | None) -> float:
+    if candidate is None:
+        return 0.0
+    return 1.0 / max(float(candidate.area), 1.0)
+
+
 def coordinate_packet(
     sequence: int,
     selected_left: LedCandidate | None,
     selected_right: LedCandidate | None,
     homography: HomographyCalibration | None,
+    max_screen_disagreement_px: float | None,
 ) -> dict[str, object]:
     touching = selected_left is not None or selected_right is not None
     raw_packet = raw_coordinate_packet(sequence, selected_left, selected_right)
@@ -275,6 +293,9 @@ def coordinate_packet(
         point_from_candidate(selected_left),
         point_from_candidate(selected_right),
         homography,
+        mapping_confidence(selected_left),
+        mapping_confidence(selected_right),
+        max_screen_disagreement_px,
     )
     return {
         "type": "screen_coordinates",
@@ -407,6 +428,7 @@ def run_detection(args: argparse.Namespace) -> None:
         f"hsv_lower={args.hsv_lower.tolist()}, hsv_upper={args.hsv_upper.tolist()}, "
         f"roi_start={args.roi_start}, roi_end={args.roi_end}, "
         f"min_brightness={args.min_brightness}, "
+        f"max_screen_disagreement_px={args.max_screen_disagreement_px}, "
         f"send_udp={args.send_udp}, laptop_ip={args.laptop_ip}, "
         f"laptop_port={args.laptop_port}"
     )
@@ -524,8 +546,17 @@ def run_detection(args: argparse.Namespace) -> None:
             ]
             selected_left = select_physical_led(candidates_left, args.left_strategy)
             selected_right = select_physical_led(candidates_right, args.right_strategy)
+            max_screen_disagreement_px = (
+                None
+                if args.max_screen_disagreement_px <= 0
+                else args.max_screen_disagreement_px
+            )
             packet = coordinate_packet(
-                sequence, selected_left, selected_right, homography
+                sequence,
+                selected_left,
+                selected_right,
+                homography,
+                max_screen_disagreement_px,
             )
             if udp_socket is not None and udp_address is not None and packet.get("valid"):
                 send_raw_udp_packet(udp_socket, udp_address, packet)

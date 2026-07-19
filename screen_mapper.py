@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,11 +33,19 @@ class HomographyCalibration:
 def build_homography(camera_points: np.ndarray, screen_points: np.ndarray) -> np.ndarray:
     camera_points = np.asarray(camera_points, dtype=np.float32)
     screen_points = np.asarray(screen_points, dtype=np.float32)
-    if camera_points.shape != (4, 2):
-        raise ValueError(f"camera_points must have shape (4, 2), got {camera_points.shape}.")
-    if screen_points.shape != (4, 2):
-        raise ValueError(f"screen_points must have shape (4, 2), got {screen_points.shape}.")
-    return cv2.getPerspectiveTransform(camera_points, screen_points)
+    if camera_points.ndim != 2 or camera_points.shape[1] != 2 or len(camera_points) < 4:
+        raise ValueError(f"camera_points must have shape (N, 2) with N >= 4, got {camera_points.shape}.")
+    if screen_points.ndim != 2 or screen_points.shape[1] != 2 or len(screen_points) != len(camera_points):
+        raise ValueError(
+            "screen_points must have shape (N, 2) matching camera_points, "
+            f"got camera={camera_points.shape}, screen={screen_points.shape}."
+        )
+    if len(camera_points) == 4:
+        return cv2.getPerspectiveTransform(camera_points, screen_points)
+    homography, _ = cv2.findHomography(camera_points, screen_points, method=0)
+    if homography is None:
+        raise ValueError("cv2.findHomography failed for the supplied calibration points.")
+    return homography.astype(np.float64)
 
 
 def screen_corner_points(screen_width_px: int, screen_height_px: int) -> np.ndarray:
@@ -53,66 +60,10 @@ def screen_corner_points(screen_width_px: int, screen_height_px: int) -> np.ndar
     )
 
 
-def _inverse_bilinear(
-    p: np.ndarray,
-    q0: np.ndarray,
-    q1: np.ndarray,
-    q2: np.ndarray,
-    q3: np.ndarray,
-) -> tuple[float, float] | None:
-    """
-    Solve (u, v) s.t. p = (1-u)(1-v)*q0 + u(1-v)*q1 + uv*q2 + (1-u)v*q3.
-    Corners: q0=TL, q1=TR, q2=BR, q3=BL.
-    Returns (u, v) where (0,0)=TL, (1,0)=TR, (1,1)=BR, (0,1)=BL.
-    """
-    e = q1 - q0
-    f = q3 - q0
-    g = q0 - q1 + q2 - q3
-    h = p - q0
-
-    ka = g[0] * f[1] - g[1] * f[0]
-    kb = e[0] * f[1] - e[1] * f[0] + h[0] * g[1] - h[1] * g[0]
-    kc = h[0] * e[1] - h[1] * e[0]
-
-    if abs(ka) < 1e-10:
-        if abs(kb) < 1e-10:
-            return None
-        v = -kc / kb
-    else:
-        disc = kb * kb - 4.0 * ka * kc
-        sq = math.sqrt(max(disc, 0.0))
-        v1 = (-kb + sq) / (2.0 * ka)
-        v2 = (-kb - sq) / (2.0 * ka)
-        v = v1 if abs(v1 - 0.5) < abs(v2 - 0.5) else v2
-
-    dx = e[0] + v * g[0]
-    dy = e[1] + v * g[1]
-    if abs(dx) >= abs(dy):
-        if abs(dx) < 1e-10:
-            return None
-        u = (h[0] - v * f[0]) / dx
-    else:
-        if abs(dy) < 1e-10:
-            return None
-        u = (h[1] - v * f[1]) / dy
-
-    return float(u), float(v)
-
-
-def map_camera_point(
-    point: np.ndarray,
-    camera_corners: np.ndarray,
-    screen_width_px: int,
-    screen_height_px: int,
-) -> np.ndarray:
-    """Map a camera pixel to screen pixel coords via inverse bilinear interpolation."""
-    corners = camera_corners.astype(np.float64)
-    p = np.asarray(point, dtype=np.float64).reshape(2)
-    result = _inverse_bilinear(p, corners[0], corners[1], corners[2], corners[3])
-    if result is None:
-        return np.array([0.5 * (screen_width_px - 1), 0.5 * (screen_height_px - 1)], dtype=np.float64)
-    u, v = result
-    return np.array([u * (screen_width_px - 1), v * (screen_height_px - 1)], dtype=np.float64)
+def map_camera_point(point: np.ndarray, homography: np.ndarray) -> np.ndarray:
+    point = np.asarray(point, dtype=np.float32).reshape(1, 1, 2)
+    mapped = cv2.perspectiveTransform(point, homography)
+    return mapped.reshape(2).astype(np.float64)
 
 
 def combine_screen_points(
@@ -204,13 +155,22 @@ def map_raw_coordinates(
     calibration: HomographyCalibration,
     confidence_0: float = 1.0,
     confidence_1: float = 1.0,
+    max_disagreement_px: float | None = None,
 ) -> dict[str, Any]:
     screen_0 = None
     screen_1 = None
     if camera_0_point is not None:
-        screen_0 = map_camera_point(camera_0_point, calibration.camera_0_points, calibration.screen_width_px, calibration.screen_height_px)
+        screen_0 = map_camera_point(camera_0_point, calibration.H0)
     if camera_1_point is not None:
-        screen_1 = map_camera_point(camera_1_point, calibration.camera_1_points, calibration.screen_width_px, calibration.screen_height_px)
+        screen_1 = map_camera_point(camera_1_point, calibration.H1)
+
+    if screen_0 is not None and screen_1 is not None and max_disagreement_px is not None:
+        disagreement = float(np.linalg.norm(screen_0 - screen_1))
+        if disagreement > max_disagreement_px:
+            if confidence_0 > confidence_1:
+                screen_1 = None
+            elif confidence_1 > confidence_0:
+                screen_0 = None
 
     combined = combine_screen_points(screen_0, screen_1, confidence_0, confidence_1)
     if combined is None:
