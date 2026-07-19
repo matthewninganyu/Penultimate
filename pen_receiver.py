@@ -10,6 +10,14 @@ from typing import Any
 
 
 RAW_PACKET_FIELDS = ("type", "sequence", "timestamp", "valid", "camera_0", "camera_1")
+SCREEN_PACKET_FIELDS = (
+    "pixel_x",
+    "pixel_y",
+    "normalized_x",
+    "normalized_y",
+    "screen_0",
+    "screen_1",
+)
 PEN_PACKET_FIELDS = (
     "sequence",
     "timestamp",
@@ -146,11 +154,15 @@ def validate_raw_packet(packet: Any) -> bool:
         return False
     if any(field not in packet for field in RAW_PACKET_FIELDS):
         return False
-    if packet["type"] != "raw_coordinates":
+    if packet["type"] not in ("raw_coordinates", "screen_coordinates"):
         return False
     if not isinstance(packet["sequence"], int):
         return False
     if not isinstance(packet["valid"], bool):
+        return False
+    if packet["type"] == "screen_coordinates" and any(
+        field not in packet for field in SCREEN_PACKET_FIELDS
+    ):
         return False
     return True
 
@@ -158,14 +170,33 @@ def validate_raw_packet(packet: Any) -> bool:
 def format_raw_packet(packet: dict[str, Any]) -> str:
     camera_0 = packet["camera_0"]
     camera_1 = packet["camera_1"]
+    if packet["type"] == "screen_coordinates":
+        if not packet["valid"]:
+            return (
+                f"seq={packet['sequence']} screen invalid "
+                f"camera_0={camera_0} camera_1={camera_1}"
+            )
+        return (
+            f"seq={packet['sequence']} screen "
+            f"px=({packet['pixel_x']}, {packet['pixel_y']}) "
+            f"norm=({packet['normalized_x']:.3f}, {packet['normalized_y']:.3f}) "
+            f"cam0={format_camera_point(camera_0)} "
+            f"cam1={format_camera_point(camera_1)}"
+        )
     if not packet["valid"] or camera_0 is None or camera_1 is None:
         return f"seq={packet['sequence']} raw invalid camera_0={camera_0} camera_1={camera_1}"
     return (
         f"seq={packet['sequence']} raw "
-        f"cam0=({camera_0['x']:.1f}, {camera_0['y']:.1f}) "
-        f"cam1=({camera_1['x']:.1f}, {camera_1['y']:.1f}) "
+        f"cam0={format_camera_point(camera_0)} "
+        f"cam1={format_camera_point(camera_1)} "
         f"area=({camera_0['area']:.1f}, {camera_1['area']:.1f})"
     )
+
+
+def format_camera_point(camera_point: dict[str, Any] | None) -> str:
+    if camera_point is None:
+        return "none"
+    return f"({camera_point['x']:.1f}, {camera_point['y']:.1f})"
 
 
 def main() -> None:

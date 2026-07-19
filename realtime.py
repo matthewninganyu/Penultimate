@@ -4,6 +4,7 @@ import argparse
 import json
 import socket
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -35,12 +36,12 @@ from led_detection import (
     parse_hsv_threshold,
     select_physical_led,
 )
-
-import socket
-
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-port = 5005
+from screen_mapper import (
+    DEFAULT_HOMOGRAPHY_CALIBRATION,
+    HomographyCalibration,
+    load_homography_calibration,
+    map_raw_coordinates,
+)
 
 DEFAULT_CAMERA_LEFT = 0
 DEFAULT_CAMERA_RIGHT = 1
@@ -53,6 +54,7 @@ DEFAULT_LEFT_STRATEGY = "rightmost"
 DEFAULT_RIGHT_STRATEGY = "leftmost"
 DEFAULT_PRINT_INTERVAL_SECONDS = 1.0
 RAW_OUTPUT_FORMATS = ("human", "json", "csv")
+DEFAULT_BROADCAST_IP = "255.255.255.255"
 DEFAULT_LAPTOP_PORT = 5005
 
 FRAME_WINDOW_NAME = "Dual Camera LED Tracking"
@@ -159,14 +161,28 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--raw-only",
+        action="store_true",
+        help="Skip screen homography mapping and output only raw camera coordinates.",
+    )
+    parser.add_argument(
+        "--homography",
+        type=Path,
+        default=DEFAULT_HOMOGRAPHY_CALIBRATION,
+        help="Saved calibration from calibrate_homography.py.",
+    )
+    parser.add_argument(
         "--send-udp",
         action="store_true",
-        help="Send selected raw camera LED coordinates to the laptop over UDP.",
+        help="Send selected coordinates to the laptop over UDP.",
     )
     parser.add_argument(
         "--laptop-ip",
-        default=None,
-        help="Laptop IP address for --send-udp, for example a USB/Ethernet IP.",
+        default=DEFAULT_BROADCAST_IP,
+        help=(
+            "UDP target for --send-udp. Defaults to broadcast so the laptop "
+            "can receive over USB/Ethernet without entering its IP."
+        ),
     )
     parser.add_argument(
         "--laptop-port",
@@ -179,8 +195,6 @@ def parse_args() -> argparse.Namespace:
         args.camera_left = args.camera
     args.hsv_lower = parse_hsv_threshold(args.hsv_lower, "--hsv-lower")
     args.hsv_upper = parse_hsv_threshold(args.hsv_upper, "--hsv-upper")
-    if args.send_udp and not args.laptop_ip:
-        parser.error("--send-udp requires --laptop-ip.")
     return args
 
 
@@ -225,6 +239,43 @@ def raw_coordinate_packet(
     }
 
 
+def point_from_candidate(candidate: LedCandidate | None) -> np.ndarray | None:
+    if candidate is None:
+        return None
+    return candidate.image_point()
+
+
+def coordinate_packet(
+    sequence: int,
+    selected_left: LedCandidate | None,
+    selected_right: LedCandidate | None,
+    homography: HomographyCalibration | None,
+) -> dict[str, object]:
+    raw_packet = raw_coordinate_packet(sequence, selected_left, selected_right)
+    if homography is None:
+        return raw_packet
+
+    mapped = map_raw_coordinates(
+        point_from_candidate(selected_left),
+        point_from_candidate(selected_right),
+        homography,
+    )
+    return {
+        "type": "screen_coordinates",
+        "sequence": sequence,
+        "timestamp": raw_packet["timestamp"],
+        "valid": bool(mapped["valid"]),
+        "camera_0": raw_packet["camera_0"],
+        "camera_1": raw_packet["camera_1"],
+        "pixel_x": mapped["pixel_x"],
+        "pixel_y": mapped["pixel_y"],
+        "normalized_x": mapped["normalized_x"],
+        "normalized_y": mapped["normalized_y"],
+        "screen_0": mapped["screen_0"],
+        "screen_1": mapped["screen_1"],
+    }
+
+
 def send_raw_udp_packet(
     udp_socket: socket.socket,
     address: tuple[str, int],
@@ -237,42 +288,63 @@ def send_raw_udp_packet(
         print(f"UDP send warning: {error}")
 
 
-def print_raw_coordinates(
-    selected_left: LedCandidate | None,
-    selected_right: LedCandidate | None,
+def print_coordinate_packet(
+    packet: dict[str, object],
     raw_output: str,
     csv_header_printed: bool,
 ) -> bool:
-    timestamp = time.time()
     if raw_output == "json":
-        print(
-            json.dumps(
-                {
-                    "timestamp": timestamp,
-                    "camera_0": candidate_payload(selected_left),
-                    "camera_1": candidate_payload(selected_right),
-                },
-                separators=(",", ":"),
-            )
-        )
+        print(json.dumps(packet, separators=(",", ":")))
         return csv_header_printed
 
     if raw_output == "csv":
         if not csv_header_printed:
-            print("timestamp,camera_0_x,camera_0_y,camera_1_x,camera_1_y")
+            print(
+                "timestamp,camera_0_x,camera_0_y,camera_1_x,camera_1_y,"
+                "valid,pixel_x,pixel_y,normalized_x,normalized_y"
+            )
             csv_header_printed = True
-        left_x = "" if selected_left is None else f"{selected_left.x:.3f}"
-        left_y = "" if selected_left is None else f"{selected_left.y:.3f}"
-        right_x = "" if selected_right is None else f"{selected_right.x:.3f}"
-        right_y = "" if selected_right is None else f"{selected_right.y:.3f}"
-        print(f"{timestamp:.6f},{left_x},{left_y},{right_x},{right_y}")
+        camera_0 = packet["camera_0"]
+        camera_1 = packet["camera_1"]
+        left_x = "" if camera_0 is None else f"{camera_0['x']:.3f}"
+        left_y = "" if camera_0 is None else f"{camera_0['y']:.3f}"
+        right_x = "" if camera_1 is None else f"{camera_1['x']:.3f}"
+        right_y = "" if camera_1 is None else f"{camera_1['y']:.3f}"
+        pixel_x = "" if packet.get("pixel_x") is None else str(packet["pixel_x"])
+        pixel_y = "" if packet.get("pixel_y") is None else str(packet["pixel_y"])
+        normalized_x = "" if packet.get("normalized_x") is None else f"{packet['normalized_x']:.6f}"
+        normalized_y = "" if packet.get("normalized_y") is None else f"{packet['normalized_y']:.6f}"
+        print(
+            f"{packet['timestamp']:.6f},{left_x},{left_y},{right_x},{right_y},"
+            f"{packet['valid']},{pixel_x},{pixel_y},{normalized_x},{normalized_y}"
+        )
         return csv_header_printed
 
-    print(
-        f"Camera 0: {format_candidate(selected_left)} | "
-        f"Camera 1: {format_candidate(selected_right)}"
+    camera_0 = packet["camera_0"]
+    camera_1 = packet["camera_1"]
+    raw_text = (
+        f"Camera 0: {format_packet_camera_point(camera_0)} | "
+        f"Camera 1: {format_packet_camera_point(camera_1)}"
     )
+    if packet["type"] == "screen_coordinates":
+        if packet["valid"]:
+            print(
+                f"Screen: pixel=({packet['pixel_x']}, {packet['pixel_y']}) "
+                f"normalized=({packet['normalized_x']:.4f}, {packet['normalized_y']:.4f}) | "
+                f"{raw_text}"
+            )
+        else:
+            print(f"Screen: invalid | {raw_text}")
+    else:
+        print(raw_text)
     return csv_header_printed
+
+
+def format_packet_camera_point(camera_point: object) -> str:
+    if camera_point is None:
+        return "none"
+    point = camera_point
+    return f"x={point['x']:.1f}, y={point['y']:.1f}"
 
 
 def run_detection(args: argparse.Namespace) -> None:
@@ -297,6 +369,7 @@ def run_detection(args: argparse.Namespace) -> None:
     last_printed_right: LedCandidate | None = None
     csv_header_printed = False
     min_brightness = args.min_brightness
+    homography = None
 
     print(
         "Starting dual realtime LED detector: "
@@ -315,10 +388,22 @@ def run_detection(args: argparse.Namespace) -> None:
     try:
         if args.send_udp:
             udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             udp_address = (args.laptop_ip, args.laptop_port)
             print(
-                f"Sending raw coordinate UDP packets to {udp_address[0]}:{udp_address[1]}."
+                f"Sending coordinate UDP packets to {udp_address[0]}:{udp_address[1]}."
             )
+
+        if not args.raw_only:
+            homography = load_homography_calibration(args.homography)
+            if homography.image_width != args.width or homography.image_height != args.height:
+                raise RuntimeError(
+                    "Homography calibration resolution mismatch: "
+                    f"calibration={homography.image_width}x{homography.image_height}, "
+                    f"runtime={args.width}x{args.height}. Re-run calibrate_homography.py "
+                    "or use matching --width/--height."
+                )
+            print(f"Loaded screen homography calibration: {args.homography}")
 
         camera_left, full_fov_crop_left = configure_camera(
             args.camera_left,
@@ -398,7 +483,7 @@ def run_detection(args: argparse.Namespace) -> None:
             ]
             selected_left = select_physical_led(candidates_left, args.left_strategy)
             selected_right = select_physical_led(candidates_right, args.right_strategy)
-            packet = raw_coordinate_packet(sequence, selected_left, selected_right)
+            packet = coordinate_packet(sequence, selected_left, selected_right, homography)
             if udp_socket is not None and udp_address is not None:
                 send_raw_udp_packet(udp_socket, udp_address, packet)
             sequence += 1
@@ -418,9 +503,8 @@ def run_detection(args: argparse.Namespace) -> None:
                 last_print_time,
                 args.print_interval,
             ):
-                csv_header_printed = print_raw_coordinates(
-                    selected_left,
-                    selected_right,
+                csv_header_printed = print_coordinate_packet(
+                    packet,
                     args.raw_output,
                     csv_header_printed,
                 )
@@ -468,10 +552,6 @@ def run_detection(args: argparse.Namespace) -> None:
             if key == ord("]"):
                 min_brightness = min(255.0, min_brightness + BRIGHTNESS_STEP)
                 print(f"Min brightness: {min_brightness:.0f}")
-
-            x, y = (0, 0)  # your logic here
-            msg = f"{x},{y};1".encode()
-            sock.sendto(msg, ("255.255.255.255", port))
 
     finally:
         safe_camera_call(camera_left, "stop", "camera 0")
