@@ -457,9 +457,25 @@ def calibrate_from_camera(args: argparse.Namespace) -> int:
         args.save_frames.mkdir(parents=True, exist_ok=True)
         existing = sorted(args.save_frames.glob("frame_*.png"))
         if existing:
-            last = int(existing[-1].stem.split("_")[1])
-            capture_count = last
-            print(f"Resuming from {last} existing frame(s) in {args.save_frames}.")
+            print(f"Loading {len(existing)} existing frame(s) from {args.save_frames}...")
+            for path in existing:
+                img = cv2.imread(str(path))
+                if img is None:
+                    print(f"  [skip] cannot read: {path.name}")
+                    continue
+                h, w = img.shape[:2]
+                if image_size is None:
+                    image_size = (w, h)
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                corners = find_checkerboard_corners(gray, board_size)
+                if corners is None:
+                    print(f"  [skip] no board found: {path.name}")
+                    continue
+                object_points.append(objp)
+                image_points.append(corners)
+                capture_count += 1
+                print(f"  [ok]   {path.name}")
+            print(f"Loaded {len(object_points)} usable frame(s).")
 
     print(
         f"Camera {args.camera}  {args.width}x{args.height}\n"

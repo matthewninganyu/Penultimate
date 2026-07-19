@@ -1,387 +1,577 @@
 from __future__ import annotations
 
 import argparse
-import logging
+import json
+import socket
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from camera_manager import DualCameraManager, OfflineFrameSource
-from config import (
-    DEFAULT_CAMERA_0,
-    DEFAULT_CAMERA_1,
-    DEFAULT_HEIGHT,
-    DEFAULT_MAX_FRAME_SKEW_MS,
-    DEFAULT_MAX_JUMP_MM,
-    DEFAULT_MAX_REPROJECTION_ERROR,
-    DEFAULT_MIN_AREA,
-    DEFAULT_SCREEN_CALIBRATION,
-    DEFAULT_SCREEN_MARGIN_MM,
-    DEFAULT_SMOOTHING_ALPHA,
-    DEFAULT_TRACKING_CONFIDENCE_THRESHOLD,
-    DEFAULT_WIDTH,
+from camera import (
+    COLOR_ORDERS,
+    FOV_MODES,
+    CAMERA_FORMAT,
+    capture_bgr_frame,
+    configure_camera,
+    ensure_frame_size,
+    print_available_cameras,
+    safe_camera_call,
+    set_full_fov_crop,
 )
-from contact_detection import ContactDetector
-from led_detection import LedDetector, parse_hsv_triplet
-from models import CameraFrame, ContactEvidence, LedCandidate, PenState, ScreenCalibration, ScreenPosition, StereoMatch
-from network_sender import UdpPenSender
-from screen_mapping import load_screen_calibration, point_to_screen_position, validate_runtime_resolution
-from stereo_matching import choose_best_stereo_match
-from tracking_filter import ExponentialPenFilter
+from led_detection import (
+    COORDINATE_PRINT_DELTA_PIXELS,
+    DEFAULT_HSV_LOWER,
+    DEFAULT_HSV_UPPER,
+    MORPH_KERNEL_SIZE,
+    SELECTION_STRATEGIES,
+    WHITE,
+    LedCandidate,
+    annotate_frame,
+    candidates_from_mask_and_frame,
+    coordinate_changed,
+    create_led_mask,
+    format_candidate,
+    parse_hsv_threshold,
+    select_physical_led,
+)
+from screen_mapper import (
+    DEFAULT_HOMOGRAPHY_CALIBRATION,
+    HomographyCalibration,
+    load_homography_calibration,
+    map_raw_coordinates,
+)
 
+DEFAULT_CAMERA_LEFT = 0
+DEFAULT_CAMERA_RIGHT = 1
+DEFAULT_WIDTH = 640
+DEFAULT_HEIGHT = 480
+DEFAULT_MIN_AREA = 30.0
+DEFAULT_MIN_BRIGHTNESS = 160.0
+BRIGHTNESS_STEP = 5.0
+DEFAULT_LEFT_STRATEGY = "rightmost"
+DEFAULT_RIGHT_STRATEGY = "leftmost"
+DEFAULT_PRINT_INTERVAL_SECONDS = 1.0
+RAW_OUTPUT_FORMATS = ("human", "json", "csv")
+DEFAULT_BROADCAST_IP = "255.255.255.255"
+DEFAULT_LAPTOP_PORT = 5005
 
-LOGGER = logging.getLogger(__name__)
-FRAME_WINDOW_NAME = "Penultimate Tracking"
-MASK_WINDOW_NAME = "Penultimate LED Masks"
-SNAPSHOT_DIR = Path("output")
+FRAME_WINDOW_NAME = "Dual Camera LED Tracking"
+MASK_WINDOW_NAME = "Dual Camera LED Masks"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Penultimate calibrated dual-camera pen tracker.")
-    parser.add_argument("--camera-0", type=int, default=DEFAULT_CAMERA_0)
-    parser.add_argument("--camera-1", type=int, default=DEFAULT_CAMERA_1)
-    parser.add_argument("--camera-left", type=int, default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--camera-right", type=int, default=None, help=argparse.SUPPRESS)
+    parser = argparse.ArgumentParser(
+        description="Realtime dual Raspberry Pi CSI camera LED detector."
+    )
+    parser.add_argument(
+        "--camera",
+        type=int,
+        default=DEFAULT_CAMERA_LEFT,
+        help=(
+            "Backward-compatible alias for --camera-left. "
+            "Ignored when --camera-left is supplied."
+        ),
+    )
+    parser.add_argument("--camera-left", type=int, default=None)
+    parser.add_argument("--camera-right", type=int, default=DEFAULT_CAMERA_RIGHT)
     parser.add_argument("--width", type=int, default=DEFAULT_WIDTH)
     parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
-    parser.add_argument("--fov-mode", choices=("full", "current"), default="full")
-    parser.add_argument("--color-order", choices=("rgb", "bgr"), default="rgb")
+    parser.add_argument(
+        "--fov-mode",
+        choices=FOV_MODES,
+        default="full",
+        help=(
+            "Use 'full' to request the widest available sensor crop and "
+            "downscale it to the preview size, or 'current' to keep "
+            "Picamera2's automatic mode choice."
+        ),
+    )
     parser.add_argument("--min-area", type=float, default=DEFAULT_MIN_AREA)
-    parser.add_argument("--lower-h", type=int, default=10)
-    parser.add_argument("--lower-s", type=int, default=150)
-    parser.add_argument("--lower-v", type=int, default=220)
-    parser.add_argument("--upper-h", type=int, default=40)
-    parser.add_argument("--upper-s", type=int, default=255)
-    parser.add_argument("--upper-v", type=int, default=255)
-    parser.add_argument("--screen-calibration", type=Path, default=DEFAULT_SCREEN_CALIBRATION)
-    parser.add_argument("--show-mask", action="store_true")
-    parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--send-udp", action="store_true")
-    parser.add_argument("--laptop-ip", default="127.0.0.1")
-    parser.add_argument("--laptop-port", type=int, default=5005)
-    parser.add_argument("--tracking-confidence-threshold", type=float, default=DEFAULT_TRACKING_CONFIDENCE_THRESHOLD)
-    parser.add_argument("--max-reprojection-error", type=float, default=DEFAULT_MAX_REPROJECTION_ERROR)
-    parser.add_argument("--max-frame-skew-ms", type=float, default=DEFAULT_MAX_FRAME_SKEW_MS)
-    parser.add_argument("--smoothing-alpha", type=float, default=DEFAULT_SMOOTHING_ALPHA)
-    parser.add_argument("--max-jump-mm", type=float, default=DEFAULT_MAX_JUMP_MM)
-    parser.add_argument("--screen-margin-mm", type=float, default=DEFAULT_SCREEN_MARGIN_MM)
-    parser.add_argument("--preview-only", action="store_true", help="Run LED candidate preview without calibration.")
-    parser.add_argument("--offline-left", type=Path, default=None)
-    parser.add_argument("--offline-right", type=Path, default=None)
-    parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--min-brightness",
+        type=float,
+        default=DEFAULT_MIN_BRIGHTNESS,
+        help=(
+            "Minimum peak brightness (0-255) a candidate must have to be "
+            "considered. Adjust live with [ and ]."
+        ),
+    )
+    parser.add_argument(
+        "--color-order",
+        choices=COLOR_ORDERS,
+        default="rgb",
+        help=(
+            "Channel order returned by Picamera2 capture_array. Use 'bgr' if "
+            "the main preview shows blue skin or swapped red/blue colors."
+        ),
+    )
+    parser.add_argument(
+        "--hsv-lower",
+        default="100,150,180",
+        help="Lower HSV blue LED threshold as H,S,V.",
+    )
+    parser.add_argument(
+        "--hsv-upper",
+        default="130,255,255",
+        help="Upper HSV blue LED threshold as H,S,V.",
+    )
+    parser.add_argument(
+        "--left-strategy",
+        choices=SELECTION_STRATEGIES,
+        default=DEFAULT_LEFT_STRATEGY,
+        help=(
+            "Candidate selection strategy for camera 0 / left preview. "
+            "Defaults to rightmost for the current dual-camera glare layout."
+        ),
+    )
+    parser.add_argument(
+        "--right-strategy",
+        choices=SELECTION_STRATEGIES,
+        default=DEFAULT_RIGHT_STRATEGY,
+        help=(
+            "Candidate selection strategy for camera 1 / right preview. "
+            "Defaults to leftmost for the current dual-camera glare layout."
+        ),
+    )
+    parser.add_argument(
+        "--show-mask",
+        action="store_true",
+        help="Show both binary LED masks in a second OpenCV window.",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run detection without opening OpenCV display windows.",
+    )
+    parser.add_argument(
+        "--print-interval",
+        type=float,
+        default=DEFAULT_PRINT_INTERVAL_SECONDS,
+        help="Maximum seconds between headless coordinate updates.",
+    )
+    parser.add_argument(
+        "--raw-output",
+        choices=RAW_OUTPUT_FORMATS,
+        default="human",
+        help=(
+            "Format for selected raw camera LED coordinates printed to stdout. "
+            "Use json or csv when feeding coordinates into another script."
+        ),
+    )
+    parser.add_argument(
+        "--raw-only",
+        action="store_true",
+        help="Skip screen homography mapping and output only raw camera coordinates.",
+    )
+    parser.add_argument(
+        "--homography",
+        type=Path,
+        default=DEFAULT_HOMOGRAPHY_CALIBRATION,
+        help="Saved calibration from calibrate_homography.py.",
+    )
+    parser.add_argument(
+        "--send-udp",
+        action="store_true",
+        help="Send selected coordinates to the laptop over UDP.",
+    )
+    parser.add_argument(
+        "--laptop-ip",
+        default=DEFAULT_BROADCAST_IP,
+        help=(
+            "UDP target for --send-udp. Defaults to broadcast so the laptop "
+            "can receive over USB/Ethernet without entering its IP."
+        ),
+    )
+    parser.add_argument(
+        "--laptop-port",
+        type=int,
+        default=DEFAULT_LAPTOP_PORT,
+        help="Laptop UDP port for --send-udp.",
+    )
     args = parser.parse_args()
-    if args.camera_left is not None:
-        args.camera_0 = args.camera_left
-    if args.camera_right is not None:
-        args.camera_1 = args.camera_right
-    if (args.offline_left is None) != (args.offline_right is None):
-        parser.error("--offline-left and --offline-right must be supplied together.")
+    if args.camera_left is None:
+        args.camera_left = args.camera
+    args.hsv_lower = parse_hsv_threshold(args.hsv_lower, "--hsv-lower")
+    args.hsv_upper = parse_hsv_threshold(args.hsv_upper, "--hsv-upper")
     return args
 
 
-def make_invalid_state(sequence: int, frame_skew_ms: float | None) -> PenState:
-    return PenState(
-        sequence=sequence,
-        timestamp=time.time(),
-        valid=False,
-        normalized_x=None,
-        normalized_y=None,
-        pixel_x=None,
-        pixel_y=None,
-        x_mm=None,
-        y_mm=None,
-        distance_mm=None,
-        touching=False,
-        contact_confidence=0.0,
-        tracking_confidence=0.0,
-        frame_skew_ms=frame_skew_ms,
-    )
+def should_print_coordinates(
+    previous_left: LedCandidate | None,
+    previous_right: LedCandidate | None,
+    current_left: LedCandidate | None,
+    current_right: LedCandidate | None,
+    last_print_time: float,
+    print_interval: float,
+) -> bool:
+    if coordinate_changed(previous_left, current_left, COORDINATE_PRINT_DELTA_PIXELS):
+        return True
+    if coordinate_changed(previous_right, current_right, COORDINATE_PRINT_DELTA_PIXELS):
+        return True
+    return time.perf_counter() - last_print_time >= print_interval
 
 
-def make_valid_state(
-    sequence: int,
-    position: ScreenPosition,
-    contact: ContactEvidence,
-    tracking_confidence: float,
-    frame_skew_ms: float,
-) -> PenState:
-    return PenState(
-        sequence=sequence,
-        timestamp=time.time(),
-        valid=True,
-        normalized_x=position.normalized_x,
-        normalized_y=position.normalized_y,
-        pixel_x=position.pixel_x,
-        pixel_y=position.pixel_y,
-        x_mm=position.x_mm,
-        y_mm=position.y_mm,
-        distance_mm=position.distance_mm,
-        touching=contact.touching,
-        contact_confidence=contact.confidence,
-        tracking_confidence=tracking_confidence,
-        frame_skew_ms=frame_skew_ms,
-    )
-
-
-def load_runtime_calibration(args: argparse.Namespace) -> ScreenCalibration | None:
-    if args.preview_only:
+def candidate_payload(candidate: LedCandidate | None) -> dict[str, float] | None:
+    if candidate is None:
         return None
-    calibration = load_screen_calibration(args.screen_calibration)
-    validate_runtime_resolution(calibration, args.width, args.height)
-    return calibration
+    return {
+        "x": float(candidate.x),
+        "y": float(candidate.y),
+        "area": float(candidate.area),
+        "peak_brightness": float(candidate.peak_brightness),
+    }
 
 
-def create_frame_source(args: argparse.Namespace) -> DualCameraManager | OfflineFrameSource:
-    if args.offline_left is not None and args.offline_right is not None:
-        return OfflineFrameSource(str(args.offline_left), str(args.offline_right))
-    return DualCameraManager(
-        args.camera_0,
-        args.camera_1,
-        args.width,
-        args.height,
-        fov_mode=args.fov_mode,
-        color_order=args.color_order,
+def raw_coordinate_packet(
+    sequence: int,
+    selected_left: LedCandidate | None,
+    selected_right: LedCandidate | None,
+) -> dict[str, object]:
+    return {
+        "type": "raw_coordinates",
+        "sequence": sequence,
+        "timestamp": time.time(),
+        "valid": selected_left is not None and selected_right is not None,
+        "camera_0": candidate_payload(selected_left),
+        "camera_1": candidate_payload(selected_right),
+    }
+
+
+def point_from_candidate(candidate: LedCandidate | None) -> np.ndarray | None:
+    if candidate is None:
+        return None
+    return candidate.image_point()
+
+
+def coordinate_packet(
+    sequence: int,
+    selected_left: LedCandidate | None,
+    selected_right: LedCandidate | None,
+    homography: HomographyCalibration | None,
+) -> dict[str, object]:
+    raw_packet = raw_coordinate_packet(sequence, selected_left, selected_right)
+    if homography is None:
+        return raw_packet
+
+    mapped = map_raw_coordinates(
+        point_from_candidate(selected_left),
+        point_from_candidate(selected_right),
+        homography,
+    )
+    return {
+        "type": "screen_coordinates",
+        "sequence": sequence,
+        "timestamp": raw_packet["timestamp"],
+        "valid": bool(mapped["valid"]),
+        "camera_0": raw_packet["camera_0"],
+        "camera_1": raw_packet["camera_1"],
+        "pixel_x": mapped["pixel_x"],
+        "pixel_y": mapped["pixel_y"],
+        "normalized_x": mapped["normalized_x"],
+        "normalized_y": mapped["normalized_y"],
+        "screen_0": mapped["screen_0"],
+        "screen_1": mapped["screen_1"],
+    }
+
+
+def send_raw_udp_packet(
+    udp_socket: socket.socket,
+    address: tuple[str, int],
+    packet: dict[str, object],
+) -> None:
+    payload = json.dumps(packet, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    try:
+        udp_socket.sendto(payload, address)
+    except OSError as error:
+        print(f"UDP send warning: {error}")
+
+
+def print_coordinate_packet(
+    packet: dict[str, object],
+    raw_output: str,
+    csv_header_printed: bool,
+) -> bool:
+    if raw_output == "json":
+        print(json.dumps(packet, separators=(",", ":")))
+        return csv_header_printed
+
+    if raw_output == "csv":
+        if not csv_header_printed:
+            print(
+                "timestamp,camera_0_x,camera_0_y,camera_1_x,camera_1_y,"
+                "valid,pixel_x,pixel_y,normalized_x,normalized_y"
+            )
+            csv_header_printed = True
+        camera_0 = packet["camera_0"]
+        camera_1 = packet["camera_1"]
+        left_x = "" if camera_0 is None else f"{camera_0['x']:.3f}"
+        left_y = "" if camera_0 is None else f"{camera_0['y']:.3f}"
+        right_x = "" if camera_1 is None else f"{camera_1['x']:.3f}"
+        right_y = "" if camera_1 is None else f"{camera_1['y']:.3f}"
+        pixel_x = "" if packet.get("pixel_x") is None else str(packet["pixel_x"])
+        pixel_y = "" if packet.get("pixel_y") is None else str(packet["pixel_y"])
+        normalized_x = "" if packet.get("normalized_x") is None else f"{packet['normalized_x']:.6f}"
+        normalized_y = "" if packet.get("normalized_y") is None else f"{packet['normalized_y']:.6f}"
+        print(
+            f"{packet['timestamp']:.6f},{left_x},{left_y},{right_x},{right_y},"
+            f"{packet['valid']},{pixel_x},{pixel_y},{normalized_x},{normalized_y}"
+        )
+        return csv_header_printed
+
+    camera_0 = packet["camera_0"]
+    camera_1 = packet["camera_1"]
+    raw_text = (
+        f"Camera 0: {format_packet_camera_point(camera_0)} | "
+        f"Camera 1: {format_packet_camera_point(camera_1)}"
+    )
+    if packet["type"] == "screen_coordinates":
+        if packet["valid"]:
+            print(
+                f"Screen: pixel=({packet['pixel_x']}, {packet['pixel_y']}) "
+                f"normalized=({packet['normalized_x']:.4f}, {packet['normalized_y']:.4f}) | "
+                f"{raw_text}"
+            )
+        else:
+            print(f"Screen: invalid | {raw_text}")
+    else:
+        print(raw_text)
+    return csv_header_printed
+
+
+def format_packet_camera_point(camera_point: object) -> str:
+    if camera_point is None:
+        return "none"
+    point = camera_point
+    return f"x={point['x']:.1f}, y={point['y']:.1f}"
+
+
+def run_detection(args: argparse.Namespace) -> None:
+    camera_info = print_available_cameras()
+    if len(camera_info) < 2:
+        raise RuntimeError(
+            f"Fewer than two cameras detected: found {len(camera_info)}."
+        )
+    if args.camera_left == args.camera_right:
+        raise RuntimeError("Camera indexes must be different for dual-camera preview.")
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, MORPH_KERNEL_SIZE)
+    camera_left = None
+    camera_right = None
+    udp_socket = None
+    udp_address = None
+    last_time = time.perf_counter()
+    last_print_time = 0.0
+    sequence = 0
+    fps = 0.0
+    last_printed_left: LedCandidate | None = None
+    last_printed_right: LedCandidate | None = None
+    csv_header_printed = False
+    min_brightness = args.min_brightness
+    homography = None
+
+    print(
+        "Starting dual realtime LED detector: "
+        f"camera_left={args.camera_left}, camera_right={args.camera_right}, "
+        f"resolution={args.width}x{args.height}, format={CAMERA_FORMAT}, "
+        f"fov_mode={args.fov_mode}, "
+        f"min_area={args.min_area}, left_strategy={args.left_strategy}, "
+        f"right_strategy={args.right_strategy}, show_mask={args.show_mask}, "
+        f"headless={args.headless}, color_order={args.color_order}, "
+        f"hsv_lower={args.hsv_lower.tolist()}, hsv_upper={args.hsv_upper.tolist()}, "
+        f"min_brightness={args.min_brightness}, "
+        f"send_udp={args.send_udp}, laptop_ip={args.laptop_ip}, "
+        f"laptop_port={args.laptop_port}"
     )
 
+    try:
+        if args.send_udp:
+            udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            udp_address = (args.laptop_ip, args.laptop_port)
+            print(
+                f"Sending coordinate UDP packets to {udp_address[0]}:{udp_address[1]}."
+            )
 
-def annotate_camera(
-    frame: np.ndarray,
-    camera_label: str,
-    candidates: list[LedCandidate],
-    selected: LedCandidate | None,
-    reflection: LedCandidate | None,
-    detailed: bool,
-) -> np.ndarray:
-    out = frame.copy()
-    cv2.putText(out, camera_label, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
-    for candidate in candidates:
-        center = (int(round(candidate.x)), int(round(candidate.y)))
-        cv2.drawContours(out, [candidate.contour], -1, (0, 255, 255), 1)
-        cv2.circle(out, center, 4, (0, 255, 255), -1)
-        if detailed:
+        if not args.raw_only:
+            homography = load_homography_calibration(args.homography)
+            if homography.image_width != args.width or homography.image_height != args.height:
+                raise RuntimeError(
+                    "Homography calibration resolution mismatch: "
+                    f"calibration={homography.image_width}x{homography.image_height}, "
+                    f"runtime={args.width}x{args.height}. Re-run calibrate_homography.py "
+                    "or use matching --width/--height."
+                )
+            print(f"Loaded screen homography calibration: {args.homography}")
+
+        camera_left, full_fov_crop_left = configure_camera(
+            args.camera_left,
+            args.width,
+            args.height,
+            args.fov_mode,
+        )
+        camera_right, full_fov_crop_right = configure_camera(
+            args.camera_right,
+            args.width,
+            args.height,
+            args.fov_mode,
+        )
+
+        camera_left.start()
+        camera_right.start()
+        set_full_fov_crop(camera_left, args.camera_left, full_fov_crop_left)
+        set_full_fov_crop(camera_right, args.camera_right, full_fov_crop_right)
+        time.sleep(1.0)
+        print(
+            "Cameras started. Sequential capture is used for this preview, "
+            "so the two frames are not yet hardware synchronized."
+        )
+        print("Press Q to quit the preview, or Ctrl+C to stop.")
+
+        while True:
+            try:
+                frame_left = capture_bgr_frame(
+                    camera_left,
+                    "Camera 0",
+                    args.color_order,
+                )
+                frame_right = capture_bgr_frame(
+                    camera_right,
+                    "Camera 1",
+                    args.color_order,
+                )
+            except RuntimeError as error:
+                print(f"Capture warning: {error}")
+                time.sleep(0.05)
+                continue
+
+            if frame_left.shape[:2] != (args.height, args.width):
+                print(
+                    "Camera 0 returned a frame with a different size; "
+                    f"resizing from {frame_left.shape[1]}x{frame_left.shape[0]} "
+                    f"to {args.width}x{args.height}."
+                )
+                frame_left = ensure_frame_size(frame_left, args.width, args.height)
+            if frame_right.shape[:2] != (args.height, args.width):
+                print(
+                    "Camera 1 returned a frame with a different size; "
+                    f"resizing from {frame_right.shape[1]}x{frame_right.shape[0]} "
+                    f"to {args.width}x{args.height}."
+                )
+                frame_right = ensure_frame_size(frame_right, args.width, args.height)
+
+            mask_left = create_led_mask(
+                frame_left, kernel, args.hsv_lower, args.hsv_upper
+            )
+            mask_right = create_led_mask(
+                frame_right, kernel, args.hsv_lower, args.hsv_upper
+            )
+            candidates_left = [
+                c
+                for c in candidates_from_mask_and_frame(
+                    frame_left, mask_left, args.min_area
+                )
+                if c.peak_brightness >= min_brightness
+            ]
+            candidates_right = [
+                c
+                for c in candidates_from_mask_and_frame(
+                    frame_right, mask_right, args.min_area
+                )
+                if c.peak_brightness >= min_brightness
+            ]
+            selected_left = select_physical_led(candidates_left, args.left_strategy)
+            selected_right = select_physical_led(candidates_right, args.right_strategy)
+            packet = coordinate_packet(sequence, selected_left, selected_right, homography)
+            if udp_socket is not None and udp_address is not None:
+                send_raw_udp_packet(udp_socket, udp_address, packet)
+            sequence += 1
+
+            now = time.perf_counter()
+            elapsed = now - last_time
+            last_time = now
+            if elapsed > 0:
+                instant_fps = 1.0 / elapsed
+                fps = instant_fps if fps == 0 else (0.9 * fps) + (0.1 * instant_fps)
+
+            if should_print_coordinates(
+                last_printed_left,
+                last_printed_right,
+                selected_left,
+                selected_right,
+                last_print_time,
+                args.print_interval,
+            ):
+                csv_header_printed = print_coordinate_packet(
+                    packet,
+                    args.raw_output,
+                    csv_header_printed,
+                )
+                last_print_time = now
+                last_printed_left = selected_left
+                last_printed_right = selected_right
+
+            if args.headless:
+                continue
+
+            annotated_left = annotate_frame(
+                frame_left, candidates_left, selected_left, "CAMERA 0", fps
+            )
+            annotated_right = annotate_frame(
+                frame_right, candidates_right, selected_right, "CAMERA 1", fps
+            )
+            combined_frame = np.hstack((annotated_left, annotated_right))
             cv2.putText(
-                out,
-                f"a={candidate.area:.0f} b={candidate.peak_brightness:.0f}",
-                (center[0] + 6, center[1] - 6),
+                combined_frame,
+                f"Brightness >= {min_brightness:.0f}  [ / ] to adjust",
+                (12, combined_frame.shape[0] - 14),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (0, 255, 255),
+                0.55,
+                WHITE,
                 1,
                 cv2.LINE_AA,
             )
-    if reflection is not None:
-        center = (int(round(reflection.x)), int(round(reflection.y)))
-        cv2.circle(out, center, 14, (255, 0, 255), 2)
-        cv2.putText(out, "REFLECTION", (center[0] + 8, center[1] + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1)
-    if selected is not None:
-        center = (int(round(selected.x)), int(round(selected.y)))
-        cv2.circle(out, center, 22, (0, 255, 0), 2)
-        cv2.putText(out, f"LED x={selected.x:.1f} y={selected.y:.1f}", (center[0] + 10, center[1] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-    return out
+            cv2.imshow(FRAME_WINDOW_NAME, combined_frame)
 
+            if args.show_mask:
+                combined_mask = np.hstack(
+                    (
+                        ensure_frame_size(mask_left, args.width, args.height),
+                        ensure_frame_size(mask_right, args.width, args.height),
+                    )
+                )
+                cv2.imshow(MASK_WINDOW_NAME, combined_mask)
 
-def draw_system_overlay(
-    combined: np.ndarray,
-    state: PenState,
-    fps: float,
-    processing_ms: dict[str, float],
-    match: StereoMatch | None,
-) -> np.ndarray:
-    lines = [
-        f"FPS {fps:.1f} skew={state.frame_skew_ms if state.frame_skew_ms is not None else -1:.1f}ms",
-        f"valid={state.valid} track={state.tracking_confidence:.2f} contact={state.contact_confidence:.2f} {'TOUCH' if state.touching else 'HOVER'}",
-    ]
-    if state.valid:
-        lines.extend(
-            [
-                f"mm=({state.x_mm:.1f}, {state.y_mm:.1f}, {state.distance_mm:.1f})",
-                f"norm=({state.normalized_x:.3f}, {state.normalized_y:.3f}) px=({state.pixel_x}, {state.pixel_y})",
-            ]
-        )
-    if match is not None:
-        lines.append(f"reproj={match.reprojection_error:.2f}px geom={match.geometry_score:.2f}")
-    lines.append(
-        " ".join(f"{key}={value:.1f}ms" for key, value in processing_ms.items())
-    )
-    for index, line in enumerate(lines):
-        cv2.putText(combined, line, (12, 32 + index * 26), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
-    return combined
-
-
-def save_snapshot(frame0: np.ndarray, frame1: np.ndarray, mask0: np.ndarray, mask1: np.ndarray, sequence: int) -> None:
-    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(SNAPSHOT_DIR / f"snapshot_{sequence:06d}_camera_0.png"), frame0)
-    cv2.imwrite(str(SNAPSHOT_DIR / f"snapshot_{sequence:06d}_camera_1.png"), frame1)
-    cv2.imwrite(str(SNAPSHOT_DIR / f"snapshot_{sequence:06d}_mask_0.png"), mask0)
-    cv2.imwrite(str(SNAPSHOT_DIR / f"snapshot_{sequence:06d}_mask_1.png"), mask1)
-
-
-def process_pair(
-    sequence: int,
-    frame0: CameraFrame,
-    frame1: CameraFrame,
-    frame_skew_ms: float,
-    detector: LedDetector,
-    calibration: ScreenCalibration | None,
-    contact_detector: ContactDetector,
-    tracking_filter: ExponentialPenFilter,
-    args: argparse.Namespace,
-) -> tuple[PenState, list[LedCandidate], list[LedCandidate], np.ndarray, np.ndarray, StereoMatch | None, dict[str, float]]:
-    timings: dict[str, float] = {}
-    start = time.perf_counter()
-    det_start = time.perf_counter()
-    candidates0, mask0 = detector.detect(frame0.frame)
-    candidates1, mask1 = detector.detect(frame1.frame)
-    timings["detect"] = (time.perf_counter() - det_start) * 1000.0
-
-    if calibration is None:
-        state = make_invalid_state(sequence, frame_skew_ms)
-        timings["total"] = (time.perf_counter() - start) * 1000.0
-        return state, candidates0, candidates1, mask0, mask1, None, timings
-
-    if frame_skew_ms > args.max_frame_skew_ms:
-        state = make_invalid_state(sequence, frame_skew_ms)
-        timings["total"] = (time.perf_counter() - start) * 1000.0
-        return state, candidates0, candidates1, mask0, mask1, None, timings
-
-    match_start = time.perf_counter()
-    previous_point = tracking_filter.point
-    match = choose_best_stereo_match(
-        candidates0,
-        candidates1,
-        calibration,
-        previous_point=previous_point,
-        max_reprojection_error=args.max_reprojection_error,
-        screen_margin_mm=args.screen_margin_mm,
-        max_jump_mm=args.max_jump_mm,
-    )
-    timings["match"] = (time.perf_counter() - match_start) * 1000.0
-
-    if match is None or match.reprojection_error > args.max_reprojection_error:
-        tracking_filter.update(None)
-        state = make_invalid_state(sequence, frame_skew_ms)
-        timings["total"] = (time.perf_counter() - start) * 1000.0
-        return state, candidates0, candidates1, mask0, mask1, match, timings
-
-    filter_start = time.perf_counter()
-    smoothed, filter_confidence = tracking_filter.update(match.point_3d)
-    timings["filter"] = (time.perf_counter() - filter_start) * 1000.0
-    if smoothed is None:
-        state = make_invalid_state(sequence, frame_skew_ms)
-        timings["total"] = (time.perf_counter() - start) * 1000.0
-        return state, candidates0, candidates1, mask0, mask1, match, timings
-
-    position = point_to_screen_position(smoothed, calibration, args.screen_margin_mm)
-    if position is None:
-        state = make_invalid_state(sequence, frame_skew_ms)
-        timings["total"] = (time.perf_counter() - start) * 1000.0
-        return state, candidates0, candidates1, mask0, mask1, match, timings
-
-    contact_start = time.perf_counter()
-    contact = contact_detector.estimate(candidates0, candidates1, match)
-    timings["contact"] = (time.perf_counter() - contact_start) * 1000.0
-    tracking_confidence = min(match.confidence, filter_confidence)
-    if tracking_confidence < args.tracking_confidence_threshold:
-        state = make_invalid_state(sequence, frame_skew_ms)
-    else:
-        state = make_valid_state(sequence, position, contact, tracking_confidence, frame_skew_ms)
-
-    timings["total"] = (time.perf_counter() - start) * 1000.0
-    return state, candidates0, candidates1, mask0, mask1, match, timings
-
-
-def run(args: argparse.Namespace) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.INFO,
-        format="%(levelname)s: %(message)s",
-    )
-    lower = parse_hsv_triplet(args.lower_h, args.lower_s, args.lower_v)
-    upper = parse_hsv_triplet(args.upper_h, args.upper_s, args.upper_v)
-    detector = LedDetector(lower, upper, args.min_area)
-    calibration = load_runtime_calibration(args)
-    source = create_frame_source(args)
-    contact_detector = ContactDetector()
-    tracking_filter = ExponentialPenFilter(args.smoothing_alpha, args.max_jump_mm)
-    sender = UdpPenSender(args.laptop_ip, args.laptop_port) if args.send_udp else None
-    detailed = bool(args.debug)
-    sequence = 0
-    fps = 0.0
-    last_frame_time = time.perf_counter()
-
-    try:
-        if isinstance(source, DualCameraManager):
-            source.start()
-        LOGGER.info("Penultimate runtime started. Press Q to quit, S snapshot, D details, C recalibration reminder.")
-        while True:
-            capture_start = time.perf_counter()
-            frame0, frame1, skew_ms = source.capture_pair()
-            capture_ms = (time.perf_counter() - capture_start) * 1000.0
-            state, candidates0, candidates1, mask0, mask1, match, timings = process_pair(
-                sequence,
-                frame0,
-                frame1,
-                skew_ms,
-                detector,
-                calibration,
-                contact_detector,
-                tracking_filter,
-                args,
-            )
-            timings = {"capture": capture_ms, **timings}
-            if sender is not None:
-                sender.send(state)
-            if args.debug or sequence % 15 == 0:
-                LOGGER.info("%s", state.to_packet())
-
-            now = time.perf_counter()
-            elapsed = now - last_frame_time
-            last_frame_time = now
-            if elapsed > 0:
-                instant_fps = 1.0 / elapsed
-                fps = instant_fps if fps == 0.0 else 0.9 * fps + 0.1 * instant_fps
-
-            if not args.headless:
-                selected0 = match.camera_0_candidate if match else None
-                selected1 = match.camera_1_candidate if match else None
-                reflection0 = match.reflection_candidate_0 if match else None
-                reflection1 = match.reflection_candidate_1 if match else None
-                annotated0 = annotate_camera(frame0.frame, "CAMERA 0", candidates0, selected0, reflection0, detailed)
-                annotated1 = annotate_camera(frame1.frame, "CAMERA 1", candidates1, selected1, reflection1, detailed)
-                combined = np.hstack((annotated0, annotated1))
-                cv2.imshow(FRAME_WINDOW_NAME, draw_system_overlay(combined, state, fps, timings, match))
-                if args.show_mask:
-                    cv2.imshow(MASK_WINDOW_NAME, np.hstack((mask0, mask1)))
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord("q"), ord("Q")):
-                    break
-                if key in (ord("d"), ord("D")):
-                    detailed = not detailed
-                if key in (ord("s"), ord("S")):
-                    save_snapshot(frame0.frame, frame1.frame, mask0, mask1, sequence)
-                    LOGGER.info("Saved snapshot %s", sequence)
-                if key in (ord("c"), ord("C")):
-                    LOGGER.info("Run calibrate_screen.py after moving either camera.")
-
-            sequence += 1
-            if args.offline_left is not None:
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q") or key == ord("Q"):
                 break
-    except KeyboardInterrupt:
-        LOGGER.info("Interrupted by Ctrl+C.")
+            if key == ord("["):
+                min_brightness = max(0.0, min_brightness - BRIGHTNESS_STEP)
+                print(f"Min brightness: {min_brightness:.0f}")
+            if key == ord("]"):
+                min_brightness = min(255.0, min_brightness + BRIGHTNESS_STEP)
+                print(f"Min brightness: {min_brightness:.0f}")
+
     finally:
-        source.close()
-        if sender is not None:
-            sender.close()
+        safe_camera_call(camera_left, "stop", "camera 0")
+        safe_camera_call(camera_right, "stop", "camera 1")
+        safe_camera_call(camera_left, "close", "camera 0")
+        safe_camera_call(camera_right, "close", "camera 1")
+        if udp_socket is not None:
+            udp_socket.close()
         cv2.destroyAllWindows()
-        LOGGER.info("Penultimate runtime shut down cleanly.")
+        print("Dual realtime LED detector shut down cleanly.")
 
 
 def main() -> None:
+    args = parse_args()
     try:
-        run(parse_args())
+        run_detection(args)
+    except KeyboardInterrupt:
+        print("Interrupted by Ctrl+C.")
     except Exception as error:
-        LOGGER.error("%s", error)
+        print(f"Error: {error}")
         raise SystemExit(1) from error
 
 
