@@ -15,6 +15,16 @@ CAMERA_FORMAT = "RGB888"
 COLOR_ORDERS = ("rgb", "bgr")
 FOV_MODES = ("full", "current")
 
+# Fixed exposure/AWB so the blue LED is a stable, unclipped blue blob instead of
+# a blown-out white core, and glare/reflections fall below threshold. Runtime
+# controls only -- reapplied every process start via apply_led_controls().
+# Sweep EXPOSURE_TIME_US (100..8000) on hardware to find where the LED core
+# turns blue and ambient goes near-black. Capped under ~10000us at 100 FPS.
+EXPOSURE_TIME_US = 1000
+ANALOGUE_GAIN = 1.0
+COLOUR_GAINS = (2.0, 2.0)  # (red, blue) manual WB gains; tune so blue reads blue
+LENS_POSITION = 4.5  # dioptres (1/m); set for the fixed working distance
+
 
 def ensure_picamera2_available() -> None:
     if Picamera2 is None:
@@ -149,6 +159,26 @@ def configure_camera(
             ) from error
 
     return camera, full_fov_crop
+
+
+def apply_led_controls(camera: Any, camera_index: int) -> None:
+    """Lock exposure/AWB/focus for blue-LED detection. Call after camera.start()."""
+    from libcamera import controls  # Pi-only; imported lazily so Mac dev works.
+
+    settings = {
+        "AeEnable": False,
+        "AwbEnable": False,
+        "AnalogueGain": ANALOGUE_GAIN,
+        "ColourGains": COLOUR_GAINS,
+        "ExposureTime": EXPOSURE_TIME_US,
+        "AfMode": controls.AfModeEnum.Manual,
+        "LensPosition": LENS_POSITION,
+        "HdrMode": controls.HdrModeEnum.Off,
+    }
+    try:
+        camera.set_controls(settings)
+    except Exception as error:  # pragma: no cover - hardware dependent.
+        print(f"Warning: Camera {camera_index} could not set LED controls: {error}")
 
 
 def set_full_fov_crop(

@@ -13,6 +13,7 @@ from camera import (
     COLOR_ORDERS,
     FOV_MODES,
     CAMERA_FORMAT,
+    apply_led_controls,
     capture_bgr_frame,
     configure_camera,
     ensure_frame_size,
@@ -450,6 +451,8 @@ def run_detection(args: argparse.Namespace) -> None:
         camera_right.start()
         set_full_fov_crop(camera_left, args.camera_left, full_fov_crop_left)
         set_full_fov_crop(camera_right, args.camera_right, full_fov_crop_right)
+        apply_led_controls(camera_left, args.camera_left)
+        apply_led_controls(camera_right, args.camera_right)
         time.sleep(1.0)
         print(
             "Cameras started. Sequential capture is used for this preview, "

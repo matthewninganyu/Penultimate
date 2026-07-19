@@ -6,6 +6,7 @@ import time
 import cv2
 
 from camera import (
+    apply_led_controls,
     capture_bgr_frame,
     configure_camera,
     ensure_frame_size,
@@ -74,6 +75,7 @@ def run_detection(args: argparse.Namespace) -> None:
         camera, full_fov_crop = configure_camera(args.camera, args.width, args.height)
         camera.start()
         set_full_fov_crop(camera, args.camera, full_fov_crop)
+        apply_led_controls(camera, args.camera)
         time.sleep(1.0)
         print("Camera started. Press Q to quit the preview, or Ctrl+C to stop.")
 
