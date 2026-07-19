@@ -16,3 +16,12 @@ B (homography): PASS 7/7. distortion recovery ~2e-5mm; no-undistort baseline 2.5
 KEY FINDING: at the ~2deg grazing mount, B's homography Jacobian is ill-conditioned -> +/-0.3px centroid noise = 2.4mm mean / 7mm max (blows budget). A same-noise ~0.35mm. A more noise-robust at the built rig; B needs less-grazing vantage or sub-0.05px centroids.
 Files: A_triangulation/{position,test_position}.py, B_homography/{position,test_position}.py.
 Tests written: yes, both PASS. NOTE: A and B use separate synthetic models (not a shared harness) - gap is qualitative but large + physically sensible.
+[2026-07-19 07:00] [BUILDER]
+Full makeover for dark-exposure imaging (Ae/Awb off, 800us).
+- Replaced fixtures with 5 new dark frames (mid,tr,br,bl,tl @1280x966).
+- Rewrote detect.py: brightest-blue-area weighted centroid (u sub-pixel/priority), stateless. 5/5 detect. test_detect ALL PASS.
+- New live_dual.py: 2 cams, locked exposure + fixed FrameRate, SensorTimestamp pairing (dt logged/accepted<8ms), side-by-side RGB window, logs both cams u,v to dual_log.csv. Applies apply_led_controls (Ae/Awb/Hdr off, manual focus).
+- plot_jitter.py -> dual: per-cam u/v std + dropouts + dt histogram/accept-rate. Smoke-tested.
+- Removed superseded live_detect.py.
+Files: detect.py, tests/test_detect.py, tests/fixtures/*, live_dual.py, plot_jitter.py.
+Tests: detect ALL PASS; plotter smoke-tested. live_dual needs Pi (picamera2) to run.
